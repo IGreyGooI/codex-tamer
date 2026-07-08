@@ -67,6 +67,7 @@ impl TcpMockServer {
                     let received = Arc::clone(&received_for_thread);
                     tokio::spawn(async move {
                         let expected_auth = auth_token.map(|token| format!("Bearer {token}"));
+                        #[allow(clippy::result_large_err)]
                         let websocket = accept_hdr_async(
                             stream,
                             move |request: &Request, response: Response| {
@@ -558,6 +559,23 @@ fn mock_result(
         "thread/list" if request["params"]["cwd"].as_str() == Some("/tmp/multiline") => {
             page(json!([sample_multiline_preview_thread("thread_multiline")]))
         }
+        "thread/list" if request["params"]["parentThreadId"].is_string() => {
+            page(json!([sample_thread_with_parent(
+                "thread_child_1",
+                request["params"]["parentThreadId"]
+                    .as_str()
+                    .unwrap_or("thread_parent")
+            )]))
+        }
+        "thread/list" if request["params"]["ancestorThreadId"].is_string() => page(json!([
+            sample_thread_with_parent("thread_grandchild_1", "thread_child_1"),
+            sample_thread_with_parent(
+                "thread_child_1",
+                request["params"]["ancestorThreadId"]
+                    .as_str()
+                    .unwrap_or("thread_parent")
+            )
+        ])),
         "thread/list" => page(json!([sample_thread("thread_1")])),
         "thread/search" if request["params"]["searchTerm"].as_str() == Some("paged") => {
             paged_search_results(request)
@@ -567,6 +585,15 @@ fn mock_result(
         "thread/turns/list" => page(json!([sample_turn()])),
         "thread/start" => json!({
             "thread": sample_thread("thread_new"),
+            "model": request["params"]["model"].as_str().unwrap_or("gpt-5.1-codex"),
+            "reasoningEffort": request["params"]["config"]["model_reasoning_effort"].as_str().unwrap_or("medium"),
+            "serviceTier": request["params"].get("serviceTier").cloned().unwrap_or(Value::Null)
+        }),
+        "thread/fork" => json!({
+            "thread": sample_forked_thread(
+                "thread_fork",
+                request["params"]["threadId"].as_str().unwrap_or("thread_1")
+            ),
             "model": request["params"]["model"].as_str().unwrap_or("gpt-5.1-codex"),
             "reasoningEffort": request["params"]["config"]["model_reasoning_effort"].as_str().unwrap_or("medium"),
             "serviceTier": request["params"].get("serviceTier").cloned().unwrap_or(Value::Null)
@@ -798,6 +825,18 @@ fn sample_thread_with_updated(id: &str, updated_at: i64) -> Value {
             "retained": true
         }
     })
+}
+
+fn sample_thread_with_parent(id: &str, parent_id: &str) -> Value {
+    let mut thread = sample_thread(id);
+    thread["parentThreadId"] = json!(parent_id);
+    thread
+}
+
+fn sample_forked_thread(id: &str, source_id: &str) -> Value {
+    let mut thread = sample_thread(id);
+    thread["forkedFromId"] = json!(source_id);
+    thread
 }
 
 fn sample_multiline_preview_thread(id: &str) -> Value {
@@ -2039,6 +2078,48 @@ fn search_since_filters_locally_across_server_pages() {
 }
 
 #[test]
+fn list_can_filter_direct_children_and_descendants() {
+    let server = MockServer::start();
+    let children = run_json(
+        &server,
+        &[
+            "list",
+            "--server",
+            "work",
+            "--json",
+            "--parent",
+            "thread_parent",
+        ],
+    );
+    assert_eq!(children["threads"][0]["id"], "thread_child_1");
+    assert_eq!(children["threads"][0]["parentThreadId"], "thread_parent");
+
+    let descendants = run_json(
+        &server,
+        &[
+            "list",
+            "--server",
+            "work",
+            "--json",
+            "--ancestor",
+            "thread_parent",
+        ],
+    );
+    assert_eq!(descendants["threads"].as_array().unwrap().len(), 2);
+    assert_eq!(descendants["threads"][0]["id"], "thread_grandchild_1");
+    assert_eq!(
+        descendants["threads"][0]["parentThreadId"],
+        "thread_child_1"
+    );
+
+    let params = server.params_for("thread/list");
+    assert_eq!(params[0]["parentThreadId"], "thread_parent");
+    assert!(params[0].get("ancestorThreadId").is_none());
+    assert_eq!(params[1]["ancestorThreadId"], "thread_parent");
+    assert!(params[1].get("parentThreadId").is_none());
+}
+
+#[test]
 fn new_send_and_settings_commands_return_follow_up_ids() {
     let server = MockServer::start();
     let cwd = server
@@ -2120,7 +2201,53 @@ fn new_send_and_settings_commands_return_follow_up_ids() {
 }
 
 #[test]
-fn config_model_defaults_apply_to_new_thread_creation_only() {
+fn fork_command_returns_new_thread_and_sends_cutoff_params() {
+    let server = MockServer::start();
+    let forked = run_json(
+        &server,
+        &[
+            "fork",
+            "--server",
+            "work",
+            "--json",
+            "--last-turn",
+            "turn_2",
+            "--model",
+            "gpt-5.6",
+            "--effort",
+            "max",
+            "--service-tier",
+            "priority",
+            "--name",
+            "Forked thread",
+            "thread_1",
+        ],
+    );
+    assert_eq!(forked["threadId"], "thread_fork");
+    assert_eq!(forked["forkedFromThreadId"], "thread_1");
+    assert_eq!(forked["lastTurnId"], "turn_2");
+    assert_eq!(forked["model"], "gpt-5.6");
+    assert_eq!(forked["effort"], "max");
+    assert_eq!(forked["serviceTier"], "priority");
+
+    let fork_params = server.params_for("thread/fork");
+    assert_eq!(fork_params.len(), 1);
+    assert_eq!(fork_params[0]["threadId"], "thread_1");
+    assert_eq!(fork_params[0]["lastTurnId"], "turn_2");
+    assert_eq!(fork_params[0]["excludeTurns"], true);
+    assert_eq!(fork_params[0]["model"], "gpt-5.6");
+    assert_eq!(fork_params[0]["config"]["model_reasoning_effort"], "max");
+    assert_eq!(fork_params[0]["serviceTier"], "priority");
+    assert_thread_yolo_params(&fork_params[0]);
+
+    let name_params = server.params_for("thread/name/set");
+    assert_eq!(name_params.len(), 1);
+    assert_eq!(name_params[0]["threadId"], "thread_fork");
+    assert_eq!(name_params[0]["name"], "Forked thread");
+}
+
+#[test]
+fn config_model_defaults_apply_to_new_threads_not_send_or_fork() {
     let server = MockServer::start();
     let cwd = server
         .config
@@ -2164,6 +2291,9 @@ path = "{}"
     );
     assert_eq!(accepted["threadId"], "thread_1");
 
+    let forked = run_json(&server, &["fork", "--server", "work", "--json", "thread_1"]);
+    assert_eq!(forked["threadId"], "thread_fork");
+
     let thread_start_params = server.params_for("thread/start");
     assert_eq!(thread_start_params.len(), 1);
     assert_eq!(thread_start_params[0]["model"], "gpt-5.5");
@@ -2178,6 +2308,14 @@ path = "{}"
     assert!(turn_start_params[0].get("effort").is_none());
     assert!(turn_start_params[1].get("model").is_none());
     assert!(turn_start_params[1].get("effort").is_none());
+
+    let fork_params = server.params_for("thread/fork");
+    assert_eq!(fork_params.len(), 1);
+    assert_eq!(fork_params[0]["threadId"], "thread_1");
+    assert_eq!(fork_params[0]["excludeTurns"], true);
+    assert!(fork_params[0].get("lastTurnId").is_none());
+    assert!(fork_params[0].get("model").is_none());
+    assert!(fork_params[0].get("config").is_none());
 }
 
 #[test]

@@ -65,11 +65,16 @@ codex-threads messages <thread_id>
 codex-threads status <thread_id>
 codex-threads send <thread_id> "follow-up message"
 codex-threads new --cwd /abs/path "initial prompt"
+codex-threads fork <thread_id> --last-turn <turn_id>
 codex-threads annotate get <thread_id>
 codex-threads annotate set <thread_id> "note"
 ```
 
-Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors, or reliable parsing.
+Use `list --parent <thread_id>` for direct spawned child threads and
+`list --ancestor <thread_id>` for spawned descendants. These filters follow
+app-server `parentThreadId` spawn edges, not `forkedFromId` history forks.
+
+Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors, parent IDs, or reliable parsing.
 
 Default limits: `list` uses `--limit 50`, `show` uses `--last 20`, and `messages` uses `--max-turns 200` unless overridden.
 
@@ -411,13 +416,20 @@ Optional flags:
 
 ```bash
 --model <model>
---effort none|minimal|low|medium|high|xhigh
+--effort none|minimal|low|medium|high|xhigh|max
 --service-tier <tier>
 --name "Readable name"
 --stream
 --no-wait
 --json
 ```
+
+Use `codex-threads fork <thread_id>` to create a new thread from existing
+history. Pass `--last-turn <turn_id>` to fork through a specific turn and use
+the same `--model`, `--effort`, `--service-tier`, `--name`, and `--json` flags
+when the fork should start with explicit settings. Without explicit model,
+effort, or service-tier flags, the fork inherits those settings from the source
+thread.
 
 ## Compact JSON Patterns
 
@@ -450,7 +462,10 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 - `search --json` returns `{ server, results, nextCursor, backwardsCursor }`; each result has `thread` and `snippet`.
 - `show --json` returns `{ server, thread, turns }`; turns are under `.turns.data`.
 - When present, `list --json`, `search --json`, and `show --json` include `annotation` on thread objects.
+- Human `list` and `search` output includes a `PARENT ID` column when any displayed thread has `parentThreadId`; use `--json` for a stable shape.
 - `messages --json` returns `{ server, threadId, messages, nextCursor, truncated }`.
+- `fork <thread_id> --json` returns `threadId`, `forkedFromThreadId`, optional `lastTurnId`, and applied model/effort/service tier fields.
+- Forked thread objects expose `forkedFromId`; `list --parent` and `list --ancestor` do not find forks.
 - `status --json` returns `{ server, reachable, loadedThreadIds, nextCursor }`.
 - `status <thread_id> --json` returns `thread`, `threadId`, `activeTurnId`, and `truncated`.
 - `status <thread_id> --load --json` resumes/loads first, unsubscribes the probing connection, then returns the same shape.

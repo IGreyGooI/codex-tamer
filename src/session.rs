@@ -20,6 +20,8 @@ pub struct ListThreadsRequest {
     pub since: Option<i64>,
     pub cwd: Option<String>,
     pub archived: bool,
+    pub parent_thread_id: Option<String>,
+    pub ancestor_thread_id: Option<String>,
     pub sort: Option<SortKey>,
     pub asc: bool,
     pub desc: bool,
@@ -71,6 +73,15 @@ pub struct LoadedStatusRequest {
     pub limit: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ThreadForkOptions {
+    pub last_turn_id: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub yolo: bool,
+}
+
 pub async fn list_threads(
     target: &Target,
     client: &mut RpcClient,
@@ -89,6 +100,8 @@ pub async fn list_threads(
     if request.archived {
         params.insert("archived".to_string(), json!(true));
     }
+    insert_opt(&mut params, "parentThreadId", request.parent_thread_id);
+    insert_opt(&mut params, "ancestorThreadId", request.ancestor_thread_id);
     if let Some(cwd) = request.cwd {
         params.insert("cwd".to_string(), json!(cwd));
     }
@@ -334,6 +347,40 @@ pub async fn loaded_status(
     Ok(
         json!({"server": target.server, "reachable": true, "loadedThreadIds": loaded["data"], "nextCursor": loaded["nextCursor"]}),
     )
+}
+
+pub async fn fork_thread(
+    client: &mut RpcClient,
+    thread_id: &str,
+    options: ThreadForkOptions,
+) -> Result<Value> {
+    let mut params = Map::new();
+    params.insert("threadId".to_string(), json!(thread_id));
+    params.insert("excludeTurns".to_string(), json!(true));
+    insert_opt(&mut params, "lastTurnId", options.last_turn_id);
+    insert_opt(&mut params, "model", options.model);
+    if let Some(tier) = options.service_tier {
+        params.insert("serviceTier".to_string(), json!(tier));
+    }
+    if let Some(effort) = options.effort {
+        params.insert(
+            "config".to_string(),
+            json!({"model_reasoning_effort": effort}),
+        );
+    }
+    if options.yolo {
+        insert_thread_yolo_permissions(&mut params);
+    }
+    client
+        .request("thread/fork", Value::Object(params), |_| {})
+        .await
+}
+
+pub fn thread_id_from_fork(fork: &Value) -> Result<String> {
+    fork["thread"]["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| app_server_error("thread/fork response missing thread.id"))
 }
 
 /// Filter configuration for [`scan_since_filtered`].

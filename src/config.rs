@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use url::Url;
 
-pub const REASONING_EFFORTS: [&str; 8] = [
+pub const KNOWN_REASONING_EFFORTS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
@@ -337,7 +337,15 @@ fn validate_defaults(scope: &str, model: Option<&str>, effort: Option<&str>) -> 
 }
 
 pub fn is_valid_reasoning_effort(effort: &str) -> bool {
-    REASONING_EFFORTS.contains(&effort)
+    !effort.trim().is_empty()
+}
+
+pub fn parse_reasoning_effort(effort: &str) -> Result<String, String> {
+    if is_valid_reasoning_effort(effort) {
+        Ok(effort.to_string())
+    } else {
+        Err("reasoning effort cannot be empty".to_string())
+    }
 }
 
 pub fn home_dir() -> PathBuf {

@@ -416,13 +416,17 @@ Optional flags:
 
 ```bash
 --model <model>
---effort none|minimal|low|medium|high|xhigh|max|ultra
+--effort <effort>
 --service-tier <tier>
 --name "Readable name"
 --stream
 --no-wait
 --json
 ```
+
+Built-in completion suggestions for `--effort` are `none`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, `max`, and `ultra`; other non-empty app-server
+effort values are passed through.
 
 Use `codex-threads fork <thread_id>` to create a new thread from existing
 history. Pass `--last-turn <turn_id>` to fork through a specific turn and use

@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 use clap::{Arg, ArgAction, Command as ClapCommand, CommandFactory};
 
 use crate::cli::{Cli, CompletionShell};
-use crate::config::{load_config, resolve_config_path};
+use crate::config::{KNOWN_REASONING_EFFORTS, load_config, resolve_config_path};
 
 pub fn normalize_shell(shell: Option<CompletionShell>) -> Result<CompletionShell> {
     if let Some(shell) = shell {
@@ -225,6 +225,12 @@ fn option_for_long<'a>(
 fn value_candidates(target: &Arg, context: &CompletionContext<'_>, _prefix: &str) -> Vec<String> {
     if target.get_long() == Some("server") {
         return server_name_candidates(context);
+    }
+    if target.get_long() == Some("effort") {
+        return KNOWN_REASONING_EFFORTS
+            .into_iter()
+            .map(str::to_string)
+            .collect();
     }
 
     target

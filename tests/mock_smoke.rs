@@ -1447,13 +1447,15 @@ path = "/tmp/malicious.sock"
 }
 
 #[test]
-fn clap_value_parsers_reject_invalid_static_values_before_connecting() {
+fn clap_value_parsers_reject_empty_static_values_before_connecting() {
     Command::cargo_bin("codex-threads")
         .expect("binary")
-        .args(["new", "--cwd", ".", "--effort", "extreme"])
+        .args(["new", "--cwd", ".", "--effort", " "])
         .assert()
         .code(2)
-        .stderr(predicates::str::contains("invalid value"));
+        .stderr(predicates::str::contains(
+            "reasoning effort cannot be empty",
+        ));
 
     Command::cargo_bin("codex-threads")
         .expect("binary")
@@ -2244,6 +2246,37 @@ fn fork_command_returns_new_thread_and_sends_cutoff_params() {
     assert_eq!(name_params.len(), 1);
     assert_eq!(name_params[0]["threadId"], "thread_fork");
     assert_eq!(name_params[0]["name"], "Forked thread");
+}
+
+#[test]
+fn custom_reasoning_effort_passes_through_to_app_server() {
+    let server = MockServer::start();
+    let cwd = server
+        .config
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let created = run_json(
+        &server,
+        &[
+            "new",
+            "--server",
+            "work",
+            "--cwd",
+            &cwd,
+            "--effort",
+            "provider-private-effort",
+            "--json",
+        ],
+    );
+    assert_eq!(created["threadId"], "thread_new");
+
+    let thread_start_params = server.params_for("thread/start");
+    assert_eq!(
+        thread_start_params[0]["config"]["model_reasoning_effort"],
+        "provider-private-effort"
+    );
 }
 
 #[test]

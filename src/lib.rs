@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn config_validation_rejects_invalid_model_defaults() {
+    fn config_validation_rejects_empty_model_defaults() {
         let config = AppConfig {
             model: Some("   ".to_string()),
             model_reasoning_effort: None,
@@ -207,10 +207,17 @@ mod tests {
 
         let config = AppConfig {
             model: None,
-            model_reasoning_effort: Some("giant".to_string()),
+            model_reasoning_effort: Some("   ".to_string()),
             servers: BTreeMap::new(),
         };
         assert!(validate_config(&config).is_err());
+
+        let config = AppConfig {
+            model: None,
+            model_reasoning_effort: Some("provider-private-effort".to_string()),
+            servers: BTreeMap::new(),
+        };
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]

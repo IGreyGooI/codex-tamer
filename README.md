@@ -402,9 +402,11 @@ New-thread model defaults:
 3. Top-level `model` and `model_reasoning_effort`
 4. Codex app-server defaults
 
-Config model defaults are applied only when creating a thread with `new`.
-Follow-up `send` commands keep the thread's existing app-server settings unless
-`--model` or `--effort` is passed explicitly.
+Config model defaults are applied only when creating a new root thread with
+`new`. Follow-up `send` commands keep the thread's existing app-server settings
+unless `--model` or `--effort` is passed explicitly. `fork` inherits the source
+thread settings unless `--model`, `--effort`, or `--service-tier` is passed
+explicitly.
 
 ## Commands
 
@@ -412,12 +414,13 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | --- | --- |
 | `servers [--json]` | List configured server aliases without connecting. |
 | `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
-| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
+| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
 | `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
+| `fork THREAD_ID` | Fork a thread. Supports `--last-turn`, `--model`, `--effort`, `--service-tier`, `--name`, and `--json`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
 | `settings show THREAD_ID` | Read model, effort, service tier, and cwd. This resumes the thread for inspection but does not force yolo permissions. |
 | `settings set THREAD_ID` | Update `--model`, `--effort`, `--service-tier`, or `--clear-service-tier`; at least one setting flag is required. |
@@ -439,6 +442,11 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `annotate prune [--dry-run]` | Remove annotations whose threads are no longer found by app-server. |
 | `completion [SHELL]` | Print shell completion setup instructions for `bash`, `zsh`, or `fish`. |
 
+`list --parent` and `list --ancestor` follow app-server spawn edges for
+subagent/side threads with `parentThreadId`. They do not list history forks;
+forks are identified by `forkedFromId` on returned thread objects and by
+`forkedFromThreadId` in `fork --json` output.
+
 Every app-server and annotation command accepts `--server ALIAS` and `--json`.
 Global
 `--config PATH`, `--connect ENDPOINT`, `--connect-auth-token-env ENV_VAR`, and
@@ -454,9 +462,10 @@ thread error, `codex-threads` resumes the target thread and retries the action
 once. That resume uses the same permission mode as the action: yolo permissions
 by default, or app-server defaults when global `--no-yolo` is passed.
 
-Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and
-`xhigh`. Accepted `goal set --status` values are `active`, `paused`, `blocked`,
-`usage-limited`, `budget-limited`, and `complete`.
+`--effort` accepts any non-empty Codex app-server reasoning effort string.
+Built-in completion suggestions are `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`, and `ultra`. Accepted `goal set --status` values are `active`,
+`paused`, `blocked`, `usage-limited`, `budget-limited`, and `complete`.
 
 ## Shell Completion
 
@@ -505,10 +514,11 @@ Regenerate the completion file after upgrading `codex-threads`.
 
 Completions suggest command names, nested subcommands, option names, static
 values such as `--sort updated|created`, `--items summary|full|none`,
-`--role user|assistant`, `--effort none|minimal|low|medium|high|xhigh`, goal
-status values, shell names for `completion`, and local configured server aliases
-for `--server`. Completion does not connect to Codex app-server, so thread IDs,
-turn IDs, and remote model IDs are not completed.
+`--role user|assistant`,
+known `--effort` values such as `none|minimal|low|medium|high|xhigh|max|ultra`,
+goal status values, shell names for `completion`, and local configured server
+aliases for `--server`. Completion does not connect to Codex app-server, so
+thread IDs, turn IDs, and remote model IDs are not completed.
 
 ## Output
 
@@ -535,8 +545,13 @@ one accepted event, zero or more progress events, and one terminal event.
 
 Commands that create or start work always return enough follow-up identifiers:
 `server`, `threadId`, and `turnId` where applicable. `new --cwd PATH` without a
-prompt creates the thread and returns `threadId`; `--stream` and `--no-wait` are
-invalid without a prompt.
+prompt creates the thread and returns `threadId`; `fork THREAD_ID` returns the
+new `threadId` and `forkedFromThreadId`; `--stream` and `--no-wait` are invalid
+without a prompt.
+
+Human `list` and `search` output includes a `PARENT ID` column when any displayed
+thread has `parentThreadId`; use `--json` for a stable machine-readable shape.
+Forked threads expose `forkedFromId` in thread objects, not `parentThreadId`.
 
 Blocking `new PROMPT` and `send` commands wait up to one hour for the turn to
 reach a terminal status. They consume realtime notifications when available and

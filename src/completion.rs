@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 use clap::{Arg, ArgAction, Command as ClapCommand, CommandFactory};
 
 use crate::cli::{Cli, CompletionShell};
-use crate::config::{load_config, resolve_config_path};
+use crate::config::{KNOWN_REASONING_EFFORTS, load_config, resolve_config_path};
 
 pub fn normalize_shell(shell: Option<CompletionShell>) -> Result<CompletionShell> {
     if let Some(shell) = shell {
@@ -226,6 +226,12 @@ fn value_candidates(target: &Arg, context: &CompletionContext<'_>, _prefix: &str
     if target.get_long() == Some("server") {
         return server_name_candidates(context);
     }
+    if target.get_long() == Some("effort") {
+        return KNOWN_REASONING_EFFORTS
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
 
     target
         .get_possible_values()
@@ -429,6 +435,10 @@ mod tests {
         assert_eq!(
             completion_candidates("h", &[String::from("new"), String::from("--effort")]),
             "high\n"
+        );
+        assert_eq!(
+            completion_candidates("u", &[String::from("new"), String::from("--effort")]),
+            "ultra\n"
         );
         assert_eq!(
             completion_candidates(

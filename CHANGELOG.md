@@ -2,7 +2,18 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add `fork THREAD_ID` for creating Codex app-server thread forks, with
+  `--last-turn` support for forking through a specific completed turn and
+  explicit model, effort, and service-tier overrides when needed
+  ([#10](https://github.com/kcosr/codex-threads/pull/10)).
+- Add `list --parent THREAD_ID` and `list --ancestor THREAD_ID` filters for
+  browsing spawned direct child threads or all spawned descendant threads
+  ([#10](https://github.com/kcosr/codex-threads/pull/10)).
+- Accept `max` and `ultra` as model reasoning effort suggestions, and pass
+  through other non-empty app-server-supported effort values
+  ([#10](https://github.com/kcosr/codex-threads/pull/10)).
 
 ## [0.2.1] - 2026-06-22
 

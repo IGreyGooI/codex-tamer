@@ -712,6 +712,8 @@ async fn fetch_browser(
                     since: query.since,
                     cwd: query.cwd,
                     archived: query.archived,
+                    parent_thread_id: None,
+                    ancestor_thread_id: None,
                     sort: query.sort,
                     asc: !query.descending,
                     desc: query.descending,

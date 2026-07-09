@@ -24,10 +24,10 @@ use crate::errors::{ExitError, usage_error};
 use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
-    ShowThreadRequest, ThreadProjection, ThreadStartOptions, ThreadStatusRequest,
-    is_thread_not_found_error, list_threads, load_messages, loaded_status, read_thread_detail,
-    request_with_resume_retry, resume_thread_for_inspection, search_threads, start_thread,
-    thread_id_from_start, thread_status,
+    ShowThreadRequest, ThreadForkOptions, ThreadProjection, ThreadStartOptions,
+    ThreadStatusRequest, fork_thread, is_thread_not_found_error, list_threads, load_messages,
+    loaded_status, read_thread_detail, request_with_resume_retry, resume_thread_for_inspection,
+    search_threads, start_thread, thread_id_from_fork, thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::turns::{
@@ -173,6 +173,17 @@ async fn run(cli: Cli) -> Result<i32> {
                 cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { new_command(target, client, command, yolo).await },
+            )
+            .await
+        }
+        Command::Fork(command) => {
+            with_client(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { fork_command(target, client, command, yolo).await },
             )
             .await
         }
@@ -613,6 +624,8 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
             since,
             cwd: command.cwd,
             archived: command.archived,
+            parent_thread_id: command.parent_thread,
+            ancestor_thread_id: command.ancestor_thread,
             sort: command.sort,
             asc: command.asc,
             desc: command.desc,
@@ -764,6 +777,64 @@ async fn new_command(
         print_key_values(&[
             ("server", target.server.as_str()),
             ("threadId", output["threadId"].as_str().unwrap_or("")),
+        ]);
+    }
+    Ok(0)
+}
+
+async fn fork_command(
+    target: Target,
+    mut client: RpcClient,
+    command: ForkCommand,
+    yolo: bool,
+) -> Result<i32> {
+    let thread_model = command.model.clone();
+    let thread_effort = command.effort.clone();
+    if let Some(effort) = thread_effort.as_deref() {
+        validate_effort(effort)?;
+    }
+    let fork = fork_thread(
+        &mut client,
+        &command.thread_id,
+        ThreadForkOptions {
+            last_turn_id: command.last_turn.clone(),
+            model: thread_model,
+            effort: thread_effort,
+            service_tier: command.service_tier.clone(),
+            yolo,
+        },
+    )
+    .await?;
+    let thread_id = thread_id_from_fork(&fork)?;
+    if let Some(name) = &command.name {
+        client
+            .request(
+                "thread/name/set",
+                json!({"threadId": thread_id, "name": name}),
+                |_| {},
+            )
+            .await?;
+    }
+    let output = json!({
+        "server": target.server,
+        "threadId": thread_id,
+        "forkedFromThreadId": command.thread_id,
+        "lastTurnId": command.last_turn,
+        "thread": fork["thread"],
+        "model": fork["model"],
+        "effort": fork["reasoningEffort"],
+        "serviceTier": fork["serviceTier"]
+    });
+    if command.json {
+        print_json(&output)?;
+    } else {
+        print_key_values(&[
+            ("server", output["server"].as_str().unwrap_or("")),
+            ("threadId", output["threadId"].as_str().unwrap_or("")),
+            (
+                "forkedFromThreadId",
+                output["forkedFromThreadId"].as_str().unwrap_or(""),
+            ),
         ]);
     }
     Ok(0)
@@ -1685,6 +1756,12 @@ fn emit_threads_result(
                 .get("annotation")
                 .is_some()
         });
+        let show_parent_threads = items.iter().any(|item| {
+            item.get("thread")
+                .unwrap_or(item)
+                .get("parentThreadId")
+                .is_some()
+        });
         let mut headers = match projection {
             ThreadProjection::Direct => vec!["UPDATED", "STATUS", "TITLE/PREVIEW"],
             ThreadProjection::SearchResult => {
@@ -1693,6 +1770,9 @@ fn emit_threads_result(
         };
         if show_annotations {
             headers.push("ANNOTATION");
+        }
+        if show_parent_threads {
+            headers.push("PARENT ID");
         }
         headers.push("THREAD ID");
         let rows = items
@@ -1715,6 +1795,9 @@ fn emit_threads_result(
                         thread["annotation"]["text"].as_str().unwrap_or(""),
                         ANNOTATION_WIDTH,
                     ));
+                }
+                if show_parent_threads {
+                    row.push(table_cell(thread["parentThreadId"].as_str().unwrap_or("")));
                 }
                 row.push(table_cell(thread["id"].as_str().unwrap_or("")));
                 row

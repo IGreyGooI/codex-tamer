@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use crate::config::REASONING_EFFORTS;
+use crate::config::parse_reasoning_effort;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -54,6 +54,7 @@ pub enum Command {
     )]
     Messages(MessagesCommand),
     New(NewCommand),
+    Fork(ForkCommand),
     Send(SendCommand),
     Settings(SettingsCommand),
     Status(StatusCommand),
@@ -120,6 +121,10 @@ pub struct ListCommand {
     pub cwd: Option<String>,
     #[arg(long)]
     pub archived: bool,
+    #[arg(long = "parent", conflicts_with = "ancestor_thread")]
+    pub parent_thread: Option<String>,
+    #[arg(long = "ancestor", conflicts_with = "parent_thread")]
+    pub ancestor_thread: Option<String>,
     #[arg(long, value_enum)]
     pub sort: Option<SortKey>,
     #[arg(long, conflicts_with = "desc")]
@@ -228,7 +233,7 @@ pub struct NewCommand {
     pub cwd: PathBuf,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(REASONING_EFFORTS))]
+    #[arg(long, value_parser = parse_reasoning_effort)]
     pub effort: Option<String>,
     #[arg(long = "service-tier")]
     pub service_tier: Option<String>,
@@ -244,13 +249,32 @@ pub struct NewCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct ForkCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    #[arg(long = "last-turn")]
+    pub last_turn: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long, value_parser = parse_reasoning_effort)]
+    pub effort: Option<String>,
+    #[arg(long = "service-tier")]
+    pub service_tier: Option<String>,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct SendCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     pub thread_id: String,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(REASONING_EFFORTS))]
+    #[arg(long, value_parser = parse_reasoning_effort)]
     pub effort: Option<String>,
     #[arg(long = "service-tier")]
     pub service_tier: Option<String>,
@@ -291,7 +315,7 @@ pub struct SettingsSetCommand {
     pub thread_id: String,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(REASONING_EFFORTS))]
+    #[arg(long, value_parser = parse_reasoning_effort)]
     pub effort: Option<String>,
     #[arg(long = "service-tier", conflicts_with = "clear_service_tier")]
     pub service_tier: Option<String>,

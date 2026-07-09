@@ -431,6 +431,10 @@ mod tests {
             "high\n"
         );
         assert_eq!(
+            completion_candidates("u", &[String::from("new"), String::from("--effort")]),
+            "ultra\n"
+        );
+        assert_eq!(
             completion_candidates(
                 "usage",
                 &[

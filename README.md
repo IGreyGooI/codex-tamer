@@ -463,8 +463,8 @@ once. That resume uses the same permission mode as the action: yolo permissions
 by default, or app-server defaults when global `--no-yolo` is passed.
 
 Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, and `max`. Accepted `goal set --status` values are `active`, `paused`,
-`blocked`, `usage-limited`, `budget-limited`, and `complete`.
+`xhigh`, `max`, and `ultra`. Accepted `goal set --status` values are `active`,
+`paused`, `blocked`, `usage-limited`, `budget-limited`, and `complete`.
 
 ## Shell Completion
 
@@ -513,10 +513,11 @@ Regenerate the completion file after upgrading `codex-threads`.
 
 Completions suggest command names, nested subcommands, option names, static
 values such as `--sort updated|created`, `--items summary|full|none`,
-`--role user|assistant`, `--effort none|minimal|low|medium|high|xhigh|max`,
-goal status values, shell names for `completion`, and local configured server
-aliases for `--server`. Completion does not connect to Codex app-server, so
-thread IDs, turn IDs, and remote model IDs are not completed.
+`--role user|assistant`,
+`--effort none|minimal|low|medium|high|xhigh|max|ultra`, goal status values,
+shell names for `completion`, and local configured server aliases for
+`--server`. Completion does not connect to Codex app-server, so thread IDs,
+turn IDs, and remote model IDs are not completed.
 
 ## Output
 

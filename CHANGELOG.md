@@ -9,7 +9,7 @@
   explicit model, effort, and service-tier overrides when needed.
 - Add `list --parent THREAD_ID` and `list --ancestor THREAD_ID` filters for
   browsing spawned direct child threads or all spawned descendant threads.
-- Accept `max` as a model reasoning effort.
+- Accept `max` and `ultra` as model reasoning efforts.
 
 ## [0.2.1] - 2026-06-22
 

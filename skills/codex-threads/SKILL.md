@@ -416,7 +416,7 @@ Optional flags:
 
 ```bash
 --model <model>
---effort none|minimal|low|medium|high|xhigh|max
+--effort none|minimal|low|medium|high|xhigh|max|ultra
 --service-tier <tier>
 --name "Readable name"
 --stream

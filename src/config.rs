@@ -7,8 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use url::Url;
 
-pub const REASONING_EFFORTS: [&str; 7] =
-    ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+pub const REASONING_EFFORTS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

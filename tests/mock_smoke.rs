@@ -2215,7 +2215,7 @@ fn fork_command_returns_new_thread_and_sends_cutoff_params() {
             "--model",
             "gpt-5.6",
             "--effort",
-            "max",
+            "ultra",
             "--service-tier",
             "priority",
             "--name",
@@ -2227,7 +2227,7 @@ fn fork_command_returns_new_thread_and_sends_cutoff_params() {
     assert_eq!(forked["forkedFromThreadId"], "thread_1");
     assert_eq!(forked["lastTurnId"], "turn_2");
     assert_eq!(forked["model"], "gpt-5.6");
-    assert_eq!(forked["effort"], "max");
+    assert_eq!(forked["effort"], "ultra");
     assert_eq!(forked["serviceTier"], "priority");
 
     let fork_params = server.params_for("thread/fork");
@@ -2236,7 +2236,7 @@ fn fork_command_returns_new_thread_and_sends_cutoff_params() {
     assert_eq!(fork_params[0]["lastTurnId"], "turn_2");
     assert_eq!(fork_params[0]["excludeTurns"], true);
     assert_eq!(fork_params[0]["model"], "gpt-5.6");
-    assert_eq!(fork_params[0]["config"]["model_reasoning_effort"], "max");
+    assert_eq!(fork_params[0]["config"]["model_reasoning_effort"], "ultra");
     assert_eq!(fork_params[0]["serviceTier"], "priority");
     assert_thread_yolo_params(&fork_params[0]);
 

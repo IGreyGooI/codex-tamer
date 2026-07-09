@@ -78,7 +78,9 @@ https://github.com/kcosr/codex-threads/releases
 Supported release platforms are currently:
 
 - `linux-x86_64`
+- `linux-arm64`
 - `macos-arm64`
+- `macos-x86_64`
 
 Install the extracted `codex-threads` binary somewhere on your `PATH`, for
 example `~/.local/bin`:
@@ -722,14 +724,23 @@ The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
 matching git tag, creates a GitHub release with notes from the changelog,
 then commits a fresh `Unreleased` section for the next cycle.
 
-Release binaries are packaged separately after the platform binaries have been
-provided or built by the release operator. Supported release platforms currently
-use archive names like:
+Release archives are packaged separately after the GitHub release exists.
+Platform-specific build automation is environment-specific and should stay in
+operator context, such as private agent-context notes or build-service wrappers,
+instead of this repository. This README is the source of truth for public
+archive names, contents, and upload layout.
+
+Supported release platforms currently use archive names like:
 
 ```text
 codex-threads-VERSION-linux-x86_64.tar.gz
+codex-threads-VERSION-linux-arm64.tar.gz
 codex-threads-VERSION-macos-arm64.tar.gz
+codex-threads-VERSION-macos-x86_64.tar.gz
 ```
+
+Each archive is a single-platform build output. Do not bundle multiple platform
+binaries into one archive.
 
 Each archive should contain one top-level directory named
 `codex-threads-VERSION-PLATFORM` with:
@@ -758,15 +769,16 @@ tar -C "$STAGE" -czf "${ROOT}.tar.gz" "$ROOT"
 rm -rf "$STAGE"
 ```
 
-Repeat that staging step for each platform, for example `linux-x86_64` and
-`macos-arm64`, using the correct binary for each target. After the GitHub
-Release exists, upload the archives:
+Repeat that staging step for each platform, using the correct binary for each
+target. After the GitHub Release exists, upload the archives:
 
 ```bash
 RELEASE_TAG="v${VERSION}"
 gh release upload "$RELEASE_TAG" \
   "codex-threads-${VERSION}-linux-x86_64.tar.gz" \
-  "codex-threads-${VERSION}-macos-arm64.tar.gz"
+  "codex-threads-${VERSION}-linux-arm64.tar.gz" \
+  "codex-threads-${VERSION}-macos-arm64.tar.gz" \
+  "codex-threads-${VERSION}-macos-x86_64.tar.gz"
 ```
 
 ## Project Structure

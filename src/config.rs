@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub model_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub allow_rate_limit_reset: bool,
 }
 
 #[derive(Debug, Clone)]

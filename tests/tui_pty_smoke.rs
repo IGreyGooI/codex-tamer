@@ -850,6 +850,7 @@ fn mock_result(
         }
         "thread/archive" => json!({"thread": state.thread_json(thread_id(request))}),
         "thread/unarchive" => json!({"thread": state.thread_json(thread_id(request))}),
+        "thread/delete" => json!({}),
         other => panic!("unexpected method {other}"),
     };
     Ok(result)

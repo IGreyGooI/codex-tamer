@@ -58,8 +58,8 @@ CLI as a safety boundary.
   and support JSON final output or newline-delimited JSON (NDJSON) streaming.
 - Model, reasoning effort, and service-tier settings where Codex app-server
   supports them.
-- Thread naming, archive/unarchive, active-turn steer/interrupt, model listing,
-  and goal get/set/clear.
+- Thread naming, archive/unarchive, TUI-only delete, active-turn steer/interrupt,
+  model listing, and goal get/set/clear.
 
 ## Screenshot
 
@@ -147,6 +147,9 @@ model_reasoning_effort = "high"
 
 [servers.main]
 endpoint = "unix:///path/to/codex.sock"
+
+# Opt in to `usage redeem` consuming banked Codex rate-limit reset credits on this server.
+# allow_rate_limit_reset = true
 ```
 
 See `config.example.toml` for a complete starting point.
@@ -233,13 +236,17 @@ browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `[` and `]` to page browser results, `f` for filters, `s` for sort, `c` for
 visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
 to confirm archive or unarchive,
-`i` to confirm interrupting the selected active thread, `r` to refresh, `y` to copy the active thread id
+`i` to confirm interrupting the selected active thread, `D` to confirm permanent deletion of
+the selected thread and its descendants, `r` to refresh, `y` to copy the active thread id
 with OSC 52, `o` to confirm opening the active thread in Codex's own TUI, and
 `u` to show Codex account usage. The usage modal shows plan, credits,
 reset-credit availability, and rate-limit windows for the active server; when
 banked reset credits are available, the `Redeem reset...` action opens a
 confirmation dialog that defaults to `Cancel` before calling Codex app-server's
-reset-credit redemption RPC. Use
+reset-credit redemption RPC. It selects the
+available detailed credit with the earliest expiry and shows that selection
+before confirming; it refuses to redeem when Codex cannot provide a selectable
+credit. Use
 `l` to explicitly load the selected or open thread, matching
 `status THREAD_ID --load`, then refresh visible metadata and history.
 In the browser, `n` creates a new session: pick the server when more than one
@@ -416,10 +423,10 @@ explicitly.
 | --- | --- |
 | `servers [--json]` | List configured server aliases without connecting. |
 | `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
-| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
+| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, repeatable `--provider` and `--source`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
-| `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
+| `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, repeatable `--provider` and `--source`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `fork THREAD_ID` | Fork a thread. Supports `--last-turn`, `--model`, `--effort`, `--service-tier`, `--name`, and `--json`. |
@@ -432,7 +439,7 @@ explicitly.
 | `name THREAD_ID NAME` | Set a thread name. |
 | `archive THREAD_ID` / `unarchive THREAD_ID` | Archive or restore a thread. |
 | `models` | List available models from the app-server. |
-| `usage` | Show account usage, rate-limit windows, plan, and credits from the app-server. |
+| `usage` | Show account usage, rate-limit windows, plan, and credits from the app-server. `usage redeem` redeems the best available reset credit only when permitted for the selected server. |
 | `goal get THREAD_ID` | Read the active goal. |
 | `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. |
 | `goal clear THREAD_ID` | Clear the active goal. |
@@ -573,7 +580,14 @@ then reports status from the loaded app-server view.
 rateLimitResetCredits }` from Codex app-server's `account/rateLimits/read`
 response. Human output summarizes the server, plan, credits, reset-credit
 count, rate-limit reached state, and primary/secondary windows for each limit
-ID.
+ID. The non-TUI `usage redeem` command is disabled by default and requires
+`allow_rate_limit_reset = true` under the selected `[servers.ALIAS]` table. It
+chooses the available detailed credit with the earliest expiry (then oldest
+grant time and ID for stable ties), sends that exact credit ID to Codex, and
+refuses when Codex does not provide enough detail to choose. Direct `--connect`
+targets cannot redeem reset credits. A successful redemption remains successful
+if the follow-up usage refresh fails; JSON output reports that condition in
+`refreshError`, while human output prints a warning.
 
 Annotations are local `codex-threads` state, not Codex app-server state. The
 state file is resolved as:
@@ -584,6 +598,8 @@ state file is resolved as:
 
 Annotations are keyed by selected server endpoint and thread ID. `annotate`
 commands can set, get, clear, list, search, and prune those local records.
+Deleting a thread in the TUI clears its root annotation; use `annotate prune` to
+remove any annotations left for deleted descendants.
 `list --json`, `search --json`, and `show --json` include an `annotation` object
 on returned thread objects when one exists. Human `list` and `search` add an
 `ANNOTATION` column only when displayed rows have annotations; human `show`
@@ -599,9 +615,10 @@ The TUI persists disposable UI preferences such as visible columns,
 auto-refresh, the 5-300 second refresh interval, preview pane, and default sort.
 Corrupt or unsupported preference files are renamed to
 `tui.json.corrupt.<epoch>` when possible and fall back to defaults instead of
-blocking launch. In search mode, `--cwd` is a local refinement over the loaded
-search page; sort controls are disabled until the app-server search API supports
-server-side sorting.
+blocking launch. In search mode, `--cwd` and `--provider` are local refinements;
+the TUI scans server pages to find up to the requested limit of matching rows.
+Sort controls are disabled until the app-server search API supports server-side
+sorting.
 
 Exit codes:
 

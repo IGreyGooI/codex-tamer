@@ -149,6 +149,7 @@ struct RejectFirst {
     method: RejectFirstMethod,
     code: i64,
     message: Option<&'static str>,
+    fail_usage_refresh_after_redemption: bool,
 }
 
 impl RejectFirst {
@@ -157,6 +158,7 @@ impl RejectFirst {
             method: RejectFirstMethod::None,
             code: -32600,
             message: None,
+            fail_usage_refresh_after_redemption: false,
         }
     }
 
@@ -165,6 +167,7 @@ impl RejectFirst {
             method,
             code: -32600,
             message: None,
+            fail_usage_refresh_after_redemption: false,
         }
     }
 
@@ -177,6 +180,16 @@ impl RejectFirst {
             method,
             code,
             message: Some(message),
+            fail_usage_refresh_after_redemption: false,
+        }
+    }
+
+    const fn with_usage_refresh_failure() -> Self {
+        Self {
+            method: RejectFirstMethod::None,
+            code: -32600,
+            message: None,
+            fail_usage_refresh_after_redemption: true,
         }
     }
 }
@@ -184,6 +197,14 @@ impl RejectFirst {
 impl MockServer {
     fn start() -> Self {
         Self::start_with_options(TurnNotificationMode::Complete, false, RejectFirst::none())
+    }
+
+    fn start_with_usage_refresh_failure() -> Self {
+        Self::start_with_options(
+            TurnNotificationMode::Complete,
+            false,
+            RejectFirst::with_usage_refresh_failure(),
+        )
     }
 
     fn start_without_turn_notifications() -> Self {
@@ -319,6 +340,15 @@ impl MockServer {
         command
     }
 
+    fn allow_rate_limit_reset(&self) {
+        let config = fs::read_to_string(&self.config).expect("read config");
+        fs::write(
+            &self.config,
+            format!("{config}\nallow_rate_limit_reset = true\n"),
+        )
+        .expect("write config");
+    }
+
     fn methods(&self) -> Vec<String> {
         self.received
             .lock()
@@ -424,6 +454,28 @@ async fn handle_websocket<S>(
                         "error": {
                             "code": reject_first.code,
                             "message": message
+                        }
+                    });
+                    if ws
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if reject_first.fail_usage_refresh_after_redemption
+                    && method == "account/rateLimits/read"
+                    && received.lock().expect("received").iter().any(|request| {
+                        request["method"].as_str() == Some("account/rateLimitResetCredit/consume")
+                    })
+                {
+                    let response = json!({
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": "usage refresh unavailable"
                         }
                     });
                     if ws
@@ -619,8 +671,10 @@ fn mock_result(
         "turn/interrupt" => json!({}),
         "thread/archive" => json!({}),
         "thread/unarchive" => json!({ "thread": sample_thread(thread_id(request)) }),
+        "thread/delete" => json!({}),
         "model/list" => page(json!([{ "id": "gpt-5.5", "name": "GPT-5.5" }])),
         "account/rateLimits/read" => sample_usage(),
+        "account/rateLimitResetCredit/consume" => json!({ "outcome": "reset" }),
         "thread/goal/get" => {
             json!({ "goal": goal_to_value(&goal_for_thread(request, goal_state)) })
         }
@@ -767,7 +821,23 @@ fn sample_usage() -> Value {
             "rateLimitReachedType": null
         },
         "rateLimitResetCredits": {
-            "availableCount": 2
+            "availableCount": 2,
+            "credits": [
+                {
+                    "id": "credit_later",
+                    "status": "available",
+                    "grantedAt": 100,
+                    "expiresAt": 1_800_000_000,
+                    "title": "Later reset"
+                },
+                {
+                    "id": "credit_soonest",
+                    "status": "available",
+                    "grantedAt": 200,
+                    "expiresAt": 1_700_000_000,
+                    "title": "Soonest reset"
+                }
+            ]
         },
         "rateLimitsByLimitId": {
             "codex": {
@@ -1315,7 +1385,7 @@ path = "/tmp/personal.sock"
         .args(["__complete", "--", "--so", "list"])
         .assert()
         .success()
-        .stdout("--sort\n");
+        .stdout("--source\n--sort\n");
 
     Command::cargo_bin("codex-threads")
         .expect("binary")
@@ -1381,7 +1451,7 @@ path = "/tmp/personal.sock"
     );
     assert_eq!(
         bash_completion(&["codex-threads", "list", "--so"], 2),
-        "--sort\n"
+        "--source\n--sort\n"
     );
     assert_eq!(
         bash_completion(&["codex-threads", "list", "--sort", "u"], 3),
@@ -1923,6 +1993,65 @@ fn usage_human_output_shows_credits_and_limit_windows() {
 }
 
 #[test]
+fn usage_redeem_requires_server_permission_without_disclosing_how_to_enable_it() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args(["usage", "redeem", "--server", "work"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+
+    assert!(stderr.contains("rate-limit reset redemption is not permitted"));
+    assert!(!stderr.contains("config"));
+    assert!(server.methods().is_empty());
+}
+
+#[test]
+fn usage_redeem_selects_and_redeems_the_soonest_expiring_credit() {
+    let server = MockServer::start();
+    server.allow_rate_limit_reset();
+
+    let output = run_json(&server, &["usage", "redeem", "--server", "work", "--json"]);
+    assert_eq!(output["outcome"], "reset");
+    assert_eq!(output["credit"]["id"], "credit_soonest");
+    assert_eq!(output["credit"]["title"], "Soonest reset");
+
+    let params = server.params_for("account/rateLimitResetCredit/consume");
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0]["creditId"], "credit_soonest");
+    assert!(
+        params[0]["idempotencyKey"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("codex-threads-"))
+    );
+}
+
+#[test]
+fn usage_redeem_reports_success_when_the_usage_refresh_fails() {
+    let server = MockServer::start_with_usage_refresh_failure();
+    server.allow_rate_limit_reset();
+
+    let output = run_json(&server, &["usage", "redeem", "--server", "work", "--json"]);
+    assert_eq!(output["outcome"], "reset");
+    assert_eq!(output["credit"]["id"], "credit_soonest");
+    assert_eq!(output["rateLimits"], Value::Null);
+    assert!(
+        output["refreshError"]
+            .as_str()
+            .is_some_and(|error| error.contains("usage refresh unavailable"))
+    );
+    assert_eq!(
+        server
+            .params_for("account/rateLimitResetCredit/consume")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn list_human_output_uses_compact_aligned_table() {
     let server = MockServer::start();
     let output = server
@@ -1980,6 +2109,8 @@ fn tui_help_exposes_interactive_filter_flags() {
     assert!(text.contains("--query"));
     assert!(text.contains("--since"));
     assert!(text.contains("--cwd"));
+    assert!(text.contains("--provider"));
+    assert!(text.contains("--source"));
     assert!(text.contains("--sort"));
     assert!(!text.contains("--json"));
 }
@@ -2119,6 +2250,35 @@ fn list_can_filter_direct_children_and_descendants() {
     assert!(params[0].get("ancestorThreadId").is_none());
     assert_eq!(params[1]["ancestorThreadId"], "thread_parent");
     assert!(params[1].get("parentThreadId").is_none());
+}
+
+#[test]
+fn list_passes_provider_and_source_filters() {
+    let server = MockServer::start();
+    let _ = run_json(
+        &server,
+        &[
+            "list",
+            "--server",
+            "work",
+            "--json",
+            "--provider",
+            "openai",
+            "--provider",
+            "azure",
+            "--source",
+            "sub-agent",
+            "--source",
+            "sub-agent-review",
+        ],
+    );
+
+    let params = server.params_for("thread/list");
+    assert_eq!(params[0]["modelProviders"], json!(["openai", "azure"]));
+    assert_eq!(
+        params[0]["sourceKinds"],
+        json!(["subAgent", "subAgentReview"])
+    );
 }
 
 #[test]

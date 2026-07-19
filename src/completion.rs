@@ -423,6 +423,10 @@ mod tests {
             completion_candidates("s", &[String::from("completion")]),
             "script\n"
         );
+        assert_eq!(
+            completion_candidates("r", &[String::from("usage")]),
+            "redeem\n"
+        );
     }
 
     #[test]

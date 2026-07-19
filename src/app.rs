@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::Parser;
@@ -21,6 +21,7 @@ use crate::config::{
     resolve_config_path, resolve_direct_target, resolve_target,
 };
 use crate::errors::{ExitError, usage_error};
+use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
 use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
@@ -302,15 +303,27 @@ async fn run(cli: Cli) -> Result<i32> {
             .await
         }
         Command::Usage(command) => {
-            with_client(
+            let rate_limit_reset_allowed_servers = config
+                .servers
+                .iter()
+                .filter(|(_, server)| server.allow_rate_limit_reset)
+                .map(|(alias, _)| alias.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let target = resolve_target_for_command(
                 &config,
                 cli.connect.as_deref(),
                 cli.connect_auth_token_env.as_deref(),
                 cli.connect_auth_token.as_deref(),
-                command.server.server.clone(),
-                |target, client| async move { usage_command(target, client, command).await },
-            )
-            .await
+                command.server.clone(),
+            )?;
+            let rate_limit_reset_allowed =
+                rate_limit_reset_allowed_servers.contains(&target.server);
+            if matches!(command.action, Some(UsageSubcommand::Redeem)) && !rate_limit_reset_allowed
+            {
+                return Err(usage_error("rate-limit reset redemption is not permitted"));
+            }
+            let client = RpcClient::connect(&target.endpoint).await?;
+            usage_command(target, client, command, rate_limit_reset_allowed).await
         }
         Command::Goal(command) => match command.command {
             GoalSubcommand::Get(command) => {
@@ -624,6 +637,8 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
             since,
             cwd: command.cwd,
             archived: command.archived,
+            model_providers: command.model_providers,
+            source_kinds: command.source_kinds,
             parent_thread_id: command.parent_thread,
             ancestor_thread_id: command.ancestor_thread,
             sort: command.sort,
@@ -651,6 +666,7 @@ async fn search_command(
             cursor: command.cursor,
             since,
             archived: command.archived,
+            source_kinds: Vec::new(),
         },
     )
     .await?;
@@ -1363,22 +1379,118 @@ async fn usage_command(
     target: Target,
     mut client: RpcClient,
     command: UsageCommand,
+    rate_limit_reset_allowed: bool,
 ) -> Result<i32> {
-    let result = client
-        .request("account/rateLimits/read", json!({}), |_| {})
-        .await?;
-    let output = json!({
-        "server": target.server,
-        "rateLimits": result["rateLimits"],
-        "rateLimitsByLimitId": result["rateLimitsByLimitId"],
-        "rateLimitResetCredits": result["rateLimitResetCredits"],
-    });
-    if command.json {
+    match command.action {
+        Some(UsageSubcommand::Redeem) => {
+            usage_redeem_command(target, client, command.json, rate_limit_reset_allowed).await
+        }
+        None => usage_read_command(target, &mut client, command.json).await,
+    }
+}
+
+async fn usage_read_command(
+    target: Target,
+    client: &mut RpcClient,
+    json_output: bool,
+) -> Result<i32> {
+    let output = usage_output(
+        &target,
+        client
+            .request("account/rateLimits/read", json!({}), |_| {})
+            .await?,
+    );
+    if json_output {
         print_json(&output)?;
     } else {
         print_usage(&output);
     }
     Ok(0)
+}
+
+async fn usage_redeem_command(
+    target: Target,
+    mut client: RpcClient,
+    json_output: bool,
+    rate_limit_reset_allowed: bool,
+) -> Result<i32> {
+    if !rate_limit_reset_allowed {
+        return Err(usage_error("rate-limit reset redemption is not permitted"));
+    }
+
+    let result = client
+        .request("account/rateLimits/read", json!({}), |_| {})
+        .await?;
+    let credit = select_best_rate_limit_reset_credit(&usage_output(&target, result))?;
+    let outcome = client
+        .request(
+            "account/rateLimitResetCredit/consume",
+            json!({
+                "idempotencyKey": create_rate_limit_reset_idempotency_key(),
+                "creditId": credit.id,
+            }),
+            |_| {},
+        )
+        .await?;
+    let (refreshed, refresh_error) = match client
+        .request("account/rateLimits/read", json!({}), |_| {})
+        .await
+    {
+        Ok(result) => (Some(usage_output(&target, result)), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let output = json!({
+        "server": target.server,
+        "outcome": outcome["outcome"],
+        "credit": {
+            "id": credit.id,
+            "title": credit.title,
+            "description": credit.description,
+            "grantedAt": credit.granted_at,
+            "expiresAt": credit.expires_at,
+        },
+        "rateLimits": refreshed.as_ref().map(|usage| usage["rateLimits"].clone()).unwrap_or(Value::Null),
+        "rateLimitsByLimitId": refreshed.as_ref().map(|usage| usage["rateLimitsByLimitId"].clone()).unwrap_or(Value::Null),
+        "rateLimitResetCredits": refreshed.as_ref().map(|usage| usage["rateLimitResetCredits"].clone()).unwrap_or(Value::Null),
+        "refreshError": refresh_error,
+    });
+    if json_output {
+        print_json(&output)?;
+    } else {
+        let title = output["credit"]["title"]
+            .as_str()
+            .unwrap_or("rate-limit reset");
+        println!(
+            "Reset request for {title}: {}",
+            output["outcome"].as_str().unwrap_or("unknown")
+        );
+        if output["refreshError"].is_null() {
+            print_usage(&output);
+        } else {
+            eprintln!(
+                "Usage refresh unavailable: {}",
+                output["refreshError"].as_str().unwrap_or("unknown error")
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn usage_output(target: &Target, result: Value) -> Value {
+    json!({
+        "server": target.server,
+        "rateLimits": result["rateLimits"],
+        "rateLimitsByLimitId": result["rateLimitsByLimitId"],
+        "rateLimitResetCredits": result["rateLimitResetCredits"],
+    })
+}
+
+fn create_rate_limit_reset_idempotency_key() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("codex-threads-{millis}-{}", std::process::id())
 }
 
 async fn goal_get_command(
@@ -2032,6 +2144,7 @@ mod tests {
                 auth_token: None,
                 model: None,
                 model_reasoning_effort: None,
+                allow_rate_limit_reset: false,
             },
         );
         servers.insert(
@@ -2044,6 +2157,7 @@ mod tests {
                 auth_token: None,
                 model: None,
                 model_reasoning_effort: None,
+                allow_rate_limit_reset: false,
             },
         );
         AppConfig {

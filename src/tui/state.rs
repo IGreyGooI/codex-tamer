@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::cli::SortKey;
+use crate::cli::{SortKey, ThreadSourceKind};
+use crate::rate_limit_reset::RateLimitResetCredit;
 use crate::tui::prefs::{TuiPrefs, VisibleColumns};
 use crate::turns::TurnControl;
 
@@ -30,6 +31,11 @@ pub enum Mode {
         server: String,
         thread_id: String,
         archived: bool,
+        return_to_detail: bool,
+    },
+    ConfirmDelete {
+        server: String,
+        thread_id: String,
         return_to_detail: bool,
     },
     ConfirmOpenCodex {
@@ -88,6 +94,7 @@ pub struct UsageModalState {
     pub message: Option<String>,
     pub selected: UsageAction,
     pub reset_idempotency_key: Option<String>,
+    pub selected_reset_credit: Option<RateLimitResetCredit>,
 }
 
 impl UsageModalState {
@@ -102,6 +109,7 @@ impl UsageModalState {
             message: None,
             selected: UsageAction::Close,
             reset_idempotency_key: None,
+            selected_reset_credit: None,
         }
     }
 
@@ -164,6 +172,7 @@ impl ResetConfirmSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountUsageSnapshot {
+    pub raw: serde_json::Value,
     pub plan: String,
     pub credits: String,
     pub limit_reached: String,
@@ -204,6 +213,8 @@ pub struct BrowserState {
     pub since: Option<i64>,
     pub cwd: Option<String>,
     pub archived: bool,
+    pub model_providers: Vec<String>,
+    pub source_kinds: Vec<ThreadSourceKind>,
     pub sort: Option<SortKey>,
     pub descending: bool,
     pub loading: bool,
@@ -507,6 +518,8 @@ impl TuiState {
                 since: init.since,
                 cwd: init.cwd,
                 archived: init.archived,
+                model_providers: Vec::new(),
+                source_kinds: Vec::new(),
                 sort,
                 descending: init.descending,
                 loading: false,
@@ -960,6 +973,10 @@ fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode 
         })
         | Mode::ConfirmInterrupt { .. }
         | Mode::ConfirmArchive {
+            return_to_detail: true,
+            ..
+        }
+        | Mode::ConfirmDelete {
             return_to_detail: true,
             ..
         }

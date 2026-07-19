@@ -5,6 +5,7 @@ mod completion;
 mod config;
 mod debuglog;
 mod errors;
+mod rate_limit_reset;
 mod rpc;
 mod session;
 mod time_filter;
@@ -57,6 +58,7 @@ mod tests {
             auth_token: None,
             model: None,
             model_reasoning_effort: None,
+            allow_rate_limit_reset: false,
         }
     }
 
@@ -69,7 +71,26 @@ mod tests {
             auth_token: None,
             model: None,
             model_reasoning_effort: None,
+            allow_rate_limit_reset: false,
         }
+    }
+
+    #[test]
+    fn rate_limit_reset_permission_is_per_server_and_defaults_to_disabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[servers.disabled]
+endpoint = "unix:///tmp/disabled.sock"
+
+[servers.enabled]
+endpoint = "unix:///tmp/enabled.sock"
+allow_rate_limit_reset = true
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.servers["disabled"].allow_rate_limit_reset);
+        assert!(config.servers["enabled"].allow_rate_limit_reset);
     }
 
     #[test]
@@ -110,6 +131,7 @@ mod tests {
                 auth_token: None,
                 model: None,
                 model_reasoning_effort: Some("high".to_string()),
+                allow_rate_limit_reset: false,
             },
         );
         servers.insert(
@@ -122,6 +144,7 @@ mod tests {
                 auth_token: None,
                 model: Some("gpt-5.5".to_string()),
                 model_reasoning_effort: None,
+                allow_rate_limit_reset: false,
             },
         );
         let config = AppConfig {
@@ -156,6 +179,7 @@ mod tests {
                 auth_token: None,
                 model: Some("gpt-5.5".to_string()),
                 model_reasoning_effort: None,
+                allow_rate_limit_reset: false,
             },
         );
         let config = AppConfig {
@@ -259,6 +283,7 @@ mod tests {
                 auth_token: None,
                 model: None,
                 model_reasoning_effort: None,
+                allow_rate_limit_reset: false,
             },
         );
         let err = validate_config(&AppConfig {

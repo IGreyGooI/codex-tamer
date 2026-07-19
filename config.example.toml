@@ -6,6 +6,10 @@ model_reasoning_effort = "high"
 [servers.main]
 endpoint = "unix:///path/to/codex.sock"
 
+# Disabled by default. When true, `usage redeem` may redeem the best available
+# detailed Codex rate-limit reset credit for this server.
+# allow_rate_limit_reset = true
+
 # Optional per-server overrides.
 # [servers.work]
 # endpoint = "ws://127.0.0.1:8765"

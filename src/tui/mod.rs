@@ -36,11 +36,12 @@ use crate::annotations::{clear_annotation, set_annotation};
 use crate::cli::{ItemsView, SortKey, TuiCommand};
 use crate::config::{Endpoint, Target};
 use crate::errors::usage_error;
+use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
 use crate::rpc::{RpcClient, RpcRequestError};
 use crate::session::{
     ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStartOptions,
-    ThreadStatusRequest, list_threads, read_thread_detail, search_threads, set_thread_archived,
-    set_thread_name, start_thread, thread_id_from_start, thread_status,
+    ThreadStatusRequest, delete_thread, list_threads, read_thread_detail, search_threads,
+    set_thread_archived, set_thread_name, start_thread, thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::tui::events::{
@@ -142,6 +143,8 @@ pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> R
         prefs,
     });
     state.browser.multi_server = targets.is_multi();
+    state.browser.model_providers = command.model_providers;
+    state.browser.source_kinds = command.source_kinds;
     state.browser.last_error = loaded_prefs.warning;
 
     let _guard = TerminalGuard::enter()?;
@@ -222,6 +225,7 @@ pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> R
                     initial_browser_load_needs_auto_attach(&event, &state);
                 let refresh_detail_after_stream = stream_finish_detail_thread(&event, &state);
                 let refresh_after_archive = archive_changed_thread(&event);
+                let refresh_after_delete = deleted_thread(&event);
                 let refresh_after_rename = rename_changed_thread(&event);
                 let refresh_after_submit = turn_submitted_thread(&event);
                 let refresh_after_load = loaded_thread(&event);
@@ -265,6 +269,9 @@ pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> R
                         .await?;
                 }
                 if refresh_after_archive.is_some() && !state.should_quit {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if refresh_after_delete.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
                 if refresh_after_rename.is_some() && !state.should_quit {
@@ -610,12 +617,14 @@ async fn fetch_worker(
             FetchRequest::ConsumeRateLimitReset {
                 server,
                 idempotency_key,
+                credit_id,
             } => {
                 let result = consume_rate_limit_reset_cached(
                     &targets,
                     &mut clients,
                     &server,
                     idempotency_key,
+                    credit_id,
                 )
                 .await;
                 match result {
@@ -712,6 +721,8 @@ async fn fetch_browser(
                     since: query.since,
                     cwd: query.cwd,
                     archived: query.archived,
+                    model_providers: query.model_providers,
+                    source_kinds: query.source_kinds,
                     parent_thread_id: None,
                     ancestor_thread_id: None,
                     sort: query.sort,
@@ -722,22 +733,23 @@ async fn fetch_browser(
             .await?
         }
         BrowserSource::Search => {
-            let mut output = search_threads(
-                target,
-                client,
-                SearchThreadsRequest {
-                    query: query.query,
-                    limit: query.limit,
-                    cursor: query.cursor,
-                    since: query.since,
-                    archived: query.archived,
-                },
-            )
-            .await?;
-            if let Some(cwd) = query.cwd {
-                filter_search_cwd(&mut output, &cwd);
+            if query.cwd.is_some() || !query.model_providers.is_empty() {
+                search_threads_with_local_filters(target, client, &query).await?
+            } else {
+                search_threads(
+                    target,
+                    client,
+                    SearchThreadsRequest {
+                        query: query.query,
+                        limit: query.limit,
+                        cursor: query.cursor,
+                        since: query.since,
+                        archived: query.archived,
+                        source_kinds: query.source_kinds.clone(),
+                    },
+                )
+                .await?
             }
-            output
         }
     };
     let rows = output["data"]
@@ -759,6 +771,71 @@ async fn fetch_browser(
         output["nextCursor"].as_str().map(str::to_string),
         output["backwardsCursor"].as_str().map(str::to_string),
     ))
+}
+
+/// `thread/search` has no `cwd` or model-provider filters. When either is
+/// requested, scan server pages until the requested number of locally matching
+/// rows is found. We deliberately do not expose a server cursor afterward: it
+/// would skip matching rows that were in a partially consumed server page.
+async fn search_threads_with_local_filters(
+    target: &Target,
+    client: &mut RpcClient,
+    query: &BrowserQuery,
+) -> Result<Value> {
+    let mut cursor = query.cursor.clone();
+    let mut matches = Vec::new();
+    loop {
+        let mut output = search_threads(
+            target,
+            client,
+            SearchThreadsRequest {
+                query: query.query.clone(),
+                limit: query.limit,
+                cursor,
+                since: query.since,
+                archived: query.archived,
+                source_kinds: query.source_kinds.clone(),
+            },
+        )
+        .await?;
+        if append_local_search_matches(
+            &mut matches,
+            &mut output,
+            query.cwd.as_deref(),
+            &query.model_providers,
+            query.limit,
+        ) {
+            matches.truncate(query.limit as usize);
+            break;
+        }
+        let next_cursor = output["nextCursor"].as_str().map(str::to_string);
+        if next_cursor.is_none() {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    Ok(json!({
+        "data": matches,
+        "nextCursor": Value::Null,
+        "backwardsCursor": Value::Null,
+    }))
+}
+
+fn append_local_search_matches(
+    matches: &mut Vec<Value>,
+    output: &mut Value,
+    cwd: Option<&str>,
+    model_providers: &[String],
+    limit: u32,
+) -> bool {
+    if let Some(cwd) = cwd {
+        filter_search_cwd(output, cwd);
+    }
+    filter_search_model_providers(output, model_providers);
+    if let Some(data) = output["data"].as_array_mut() {
+        matches.append(data);
+    }
+    matches.len() >= limit as usize
 }
 
 async fn fetch_browser_all(
@@ -939,11 +1016,12 @@ async fn consume_rate_limit_reset_cached(
     clients: &mut RpcClientCache,
     server: &str,
     idempotency_key: String,
+    credit_id: String,
 ) -> Result<(String, Option<Value>, Option<String>)> {
     let target = targets.get(server)?.clone();
     let cached = clients.take(server);
     let (result, client) =
-        consume_rate_limit_reset_with_client(target, cached, idempotency_key).await;
+        consume_rate_limit_reset_with_client(target, cached, idempotency_key, credit_id).await;
     if let Some(client) = client {
         clients.insert(server.to_string(), client);
     }
@@ -954,6 +1032,7 @@ async fn consume_rate_limit_reset_with_client(
     target: Target,
     cached: Option<RpcClient>,
     idempotency_key: String,
+    credit_id: String,
 ) -> (
     Result<(String, Option<Value>, Option<String>)>,
     Option<RpcClient>,
@@ -968,7 +1047,7 @@ async fn consume_rate_limit_reset_with_client(
     let result = client
         .request(
             "account/rateLimitResetCredit/consume",
-            json!({ "idempotencyKey": idempotency_key }),
+            json!({ "idempotencyKey": idempotency_key, "creditId": credit_id }),
             |_| {},
         )
         .await;
@@ -1024,6 +1103,7 @@ fn account_usage_snapshot(result: &Value) -> AccountUsageSnapshot {
         .flat_map(|(limit_key, snapshot)| account_usage_window_rows(limit_key, snapshot))
         .collect();
     AccountUsageSnapshot {
+        raw: result.clone(),
         plan,
         credits,
         limit_reached,
@@ -1341,11 +1421,13 @@ async fn schedule_rate_limit_reset_consume(
     fetch_tx: &mpsc::Sender<FetchRequest>,
     server: String,
     idempotency_key: String,
+    credit_id: String,
 ) -> Result<()> {
     fetch_tx
         .try_send(FetchRequest::ConsumeRateLimitReset {
             server,
             idempotency_key,
+            credit_id,
         })
         .map_err(|err| usage_error(format!("failed to schedule rate-limit reset: {err}")))?;
     Ok(())
@@ -1375,6 +1457,8 @@ async fn schedule_browser_page(
         since: state.browser.since,
         cwd: state.browser.cwd.clone(),
         archived: state.browser.archived,
+        model_providers: state.browser.model_providers.clone(),
+        source_kinds: state.browser.source_kinds.clone(),
         sort: state.browser.sort,
         descending: state.browser.descending,
         relative_updated: state.prefs.browser.relative_updated,
@@ -1898,6 +1982,34 @@ async fn handle_terminal_event(
             }
             return Ok(TerminalEventOutcome::none());
         }
+        Mode::ConfirmDelete {
+            server,
+            thread_id,
+            return_to_detail,
+        } => {
+            let target = targets.get(&server)?;
+            let return_mode = if return_to_detail {
+                Mode::Detail
+            } else {
+                Mode::Browser
+            };
+            match key.code {
+                KeyCode::Esc => state.mode = return_mode,
+                KeyCode::Enter => {
+                    state.mode = return_mode;
+                    state.set_notice(format!("deleting {thread_id}..."));
+                    spawn_delete_task(target.clone(), thread_id, app_tx.clone());
+                }
+                _ => {
+                    state.mode = Mode::ConfirmDelete {
+                        server,
+                        thread_id,
+                        return_to_detail,
+                    }
+                }
+            }
+            return Ok(TerminalEventOutcome::none());
+        }
         Mode::ConfirmOpenCodex {
             server,
             thread_id,
@@ -1988,10 +2100,25 @@ async fn handle_terminal_event(
                         if usage.redeeming || usage.loading {
                             state.mode = Mode::Usage(usage);
                         } else if usage.reset_count().unwrap_or(0) > 0 {
-                            state.mode = Mode::ConfirmRateLimitReset {
-                                usage,
-                                selected: ResetConfirmSelection::Cancel,
-                            };
+                            match usage
+                                .snapshot
+                                .as_ref()
+                                .map(|snapshot| &snapshot.raw)
+                                .ok_or_else(|| usage_error("usage data is unavailable"))
+                                .and_then(select_best_rate_limit_reset_credit)
+                            {
+                                Ok(credit) => {
+                                    usage.selected_reset_credit = Some(credit);
+                                    state.mode = Mode::ConfirmRateLimitReset {
+                                        usage,
+                                        selected: ResetConfirmSelection::Cancel,
+                                    };
+                                }
+                                Err(err) => {
+                                    usage.message = Some(err.to_string());
+                                    state.mode = Mode::Usage(usage);
+                                }
+                            }
                         } else {
                             usage.message = Some("No banked resets available.".to_string());
                             state.mode = Mode::Usage(usage);
@@ -2028,10 +2155,25 @@ async fn handle_terminal_event(
                             .clone()
                             .unwrap_or_else(create_rate_limit_reset_idempotency_key);
                         usage.reset_idempotency_key = Some(idempotency_key.clone());
-                        if let Err(err) =
-                            schedule_rate_limit_reset_consume(fetch_tx, server, idempotency_key)
-                                .await
+                        let result = match usage
+                            .selected_reset_credit
+                            .as_ref()
+                            .map(|credit| credit.id.clone())
                         {
+                            Some(credit_id) => {
+                                schedule_rate_limit_reset_consume(
+                                    fetch_tx,
+                                    server,
+                                    idempotency_key,
+                                    credit_id,
+                                )
+                                .await
+                            }
+                            None => Err(usage_error(
+                                "no selectable rate-limit reset credit is selected",
+                            )),
+                        };
+                        if let Err(err) = result {
                             usage.redeeming = false;
                             usage.error = Some(err.to_string());
                             usage.message = Some("Reset was not scheduled.".to_string());
@@ -2156,6 +2298,16 @@ async fn handle_terminal_event(
                     server,
                     thread_id,
                     archived,
+                    return_to_detail,
+                };
+            }
+        }
+        KeyCode::Char('D') => {
+            if let Some((server, thread_id)) = active_thread_key(state) {
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode = Mode::ConfirmDelete {
+                    server,
+                    thread_id,
                     return_to_detail,
                 };
             }
@@ -2700,6 +2852,10 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
             return_to_detail: true,
             ..
         }
+        | Mode::ConfirmDelete {
+            return_to_detail: true,
+            ..
+        }
         | Mode::ConfirmOpenCodex {
             return_to_detail: true,
             ..
@@ -2726,6 +2882,10 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
         | Mode::NewSessionCwdInput { .. }
         | Mode::NewSessionTitleInput { .. }
         | Mode::ConfirmArchive {
+            return_to_detail: false,
+            ..
+        }
+        | Mode::ConfirmDelete {
             return_to_detail: false,
             ..
         }
@@ -3015,6 +3175,35 @@ fn set_annotation_in_state(
         && detail.thread_id == thread_id
     {
         detail.annotation = value;
+    }
+}
+
+fn remove_deleted_thread_from_state(state: &mut TuiState, server: &str, thread_id: &str) {
+    state
+        .browser
+        .rows
+        .retain(|row| row.server != server || row.id != thread_id);
+    state.browser.selected = state
+        .browser
+        .selected
+        .min(state.browser.rows.len().saturating_sub(1));
+    if state
+        .detail
+        .as_ref()
+        .is_some_and(|detail| detail.server == server && detail.thread_id == thread_id)
+    {
+        state.detail = None;
+        state.pending_detail_jump = None;
+        state.mode = Mode::Browser;
+    }
+    reset_preview_for_thread(state, server, thread_id);
+    if state
+        .stream
+        .as_ref()
+        .is_some_and(|stream| stream.server == server && stream.thread_id == thread_id)
+    {
+        detach_stream(state);
+        state.stream = None;
     }
 }
 
@@ -3742,6 +3931,41 @@ fn spawn_archive_task(
     });
 }
 
+fn spawn_delete_task(target: Target, thread_id: String, app_tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let server = target.server.clone();
+        let result: Result<()> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            delete_thread(&mut client, &thread_id).await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                let annotation_error = clear_annotation(&target, &thread_id)
+                    .err()
+                    .map(|error| error.to_string());
+                app_tx
+                    .send(AppEvent::ThreadDeleted {
+                        server,
+                        thread_id,
+                        annotation_error,
+                    })
+                    .ok();
+            }
+            Err(err) => {
+                app_tx
+                    .send(AppEvent::ThreadDeleteFailed {
+                        server,
+                        thread_id,
+                        error: err.to_string(),
+                    })
+                    .ok();
+            }
+        };
+    });
+}
+
 fn spawn_rename_task(
     target: Target,
     thread_id: String,
@@ -4129,6 +4353,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 {
                     usage.invalidate_reset_availability();
                     usage.clear_reset_idempotency_key();
+                    usage.selected_reset_credit = None;
                     usage.message = Some(message.clone());
                     usage.redeeming = false;
                 }
@@ -4473,6 +4698,25 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 if archived { "archive" } else { "unarchive" }
             ));
         }
+        AppEvent::ThreadDeleted {
+            server,
+            thread_id,
+            annotation_error,
+        } => {
+            remove_deleted_thread_from_state(state, &server, &thread_id);
+            let message = match annotation_error {
+                Some(error) => format!("deleted {thread_id}; annotation cleanup failed: {error}"),
+                None => format!("deleted {thread_id}"),
+            };
+            state.set_notice(message);
+        }
+        AppEvent::ThreadDeleteFailed {
+            server,
+            thread_id,
+            error,
+        } => {
+            state.set_notice(format!("failed to delete {server}/{thread_id}: {error}"));
+        }
         AppEvent::RenameChanged {
             server,
             thread_id,
@@ -4508,8 +4752,11 @@ fn apply_usage_loaded(state: &mut TuiState, server: String, usage: Value, messag
         modal.redeeming = false;
         modal.error = None;
         modal.snapshot = Some(snapshot);
+        // A refresh can choose a different credit. Do not let a retry key for
+        // the old credit be reused for that new logical redemption.
+        modal.clear_reset_idempotency_key();
+        modal.selected_reset_credit = None;
         if let Some(message) = message {
-            modal.clear_reset_idempotency_key();
             modal.message = Some(message);
         }
     }
@@ -4538,6 +4785,15 @@ fn reset_outcome_message(outcome: &str) -> &'static str {
 fn archive_changed_thread(event: &AppEvent) -> Option<(String, String)> {
     match event {
         AppEvent::ArchiveChanged {
+            server, thread_id, ..
+        } => Some((server.clone(), thread_id.clone())),
+        _ => None,
+    }
+}
+
+fn deleted_thread(event: &AppEvent) -> Option<(String, String)> {
+    match event {
+        AppEvent::ThreadDeleted {
             server, thread_id, ..
         } => Some((server.clone(), thread_id.clone())),
         _ => None,
@@ -6375,6 +6631,20 @@ fn filter_search_cwd(output: &mut Value, cwd: &str) {
     data.retain(|item| item["thread"]["cwd"].as_str() == Some(cwd));
 }
 
+fn filter_search_model_providers(output: &mut Value, model_providers: &[String]) {
+    if model_providers.is_empty() {
+        return;
+    }
+    let Some(data) = output["data"].as_array_mut() else {
+        return;
+    };
+    data.retain(|item| {
+        item["thread"]["modelProvider"]
+            .as_str()
+            .is_some_and(|provider| model_providers.iter().any(|filter| filter == provider))
+    });
+}
+
 fn format_epoch(value: i64) -> String {
     chrono::DateTime::from_timestamp(value, 0)
         .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M").to_string())
@@ -6730,6 +7000,7 @@ mod tests {
             1,
             None,
         ));
+        state.mode = Mode::Detail;
         state.detail.as_mut().unwrap().server = "work".to_string();
         state.mode = Mode::Browser;
 
@@ -9695,6 +9966,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows = vec![test_thread_row("t1", "idle")];
+        state.mode = Mode::Detail;
         state.detail = Some(detail_state(
             serde_json::json!({
                 "thread": {"id": "t1", "name": "Old", "status": {"type": "idle"}},
@@ -10371,6 +10643,161 @@ mod tests {
                 ..
             } if thread_id == "t1"
         ));
+    }
+
+    #[tokio::test]
+    async fn delete_shortcut_opens_confirmation_for_selected_thread() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmDelete {
+                ref thread_id,
+                return_to_detail: false,
+                ..
+            } if thread_id == "t1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_confirmation_keeps_detail_open_while_request_is_pending() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Detail));
+        assert!(state.detail.is_some());
+
+        handle_app_event(
+            AppEvent::ThreadDeleteFailed {
+                server: "work".to_string(),
+                thread_id: "t1".to_string(),
+                error: "denied".to_string(),
+            },
+            &mut state,
+        );
+
+        assert!(matches!(state.mode, Mode::Detail));
+        assert!(state.detail.is_some());
+    }
+
+    #[test]
+    fn delete_event_removes_selected_thread_and_detail() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        handle_app_event(
+            AppEvent::ThreadDeleted {
+                server: "work".to_string(),
+                thread_id: "t1".to_string(),
+                annotation_error: None,
+            },
+            &mut state,
+        );
+
+        assert!(state.browser.rows.is_empty());
+        assert!(state.detail.is_none());
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(state.stream.is_none());
+        assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
+        assert!(
+            state
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.message == "deleted t1")
+        );
     }
 
     #[tokio::test]
@@ -11487,12 +11914,14 @@ mod tests {
         let FetchRequest::ConsumeRateLimitReset {
             server,
             idempotency_key,
+            credit_id,
         } = fetch_rx.recv().await.expect("consume request")
         else {
             panic!("expected consume request");
         };
         assert_eq!(server, "work");
         assert!(idempotency_key.starts_with("codex-threads-"));
+        assert_eq!(credit_id, "credit_1");
         assert_eq!(
             stored_idempotency_key.as_deref(),
             Some(idempotency_key.as_str())
@@ -11584,12 +12013,14 @@ mod tests {
         let FetchRequest::ConsumeRateLimitReset {
             server,
             idempotency_key,
+            credit_id,
         } = fetch_rx.recv().await.expect("consume request")
         else {
             panic!("expected consume request");
         };
         assert_eq!(server, "work");
         assert_eq!(idempotency_key, "retry-key");
+        assert_eq!(credit_id, "credit_1");
     }
 
     #[test]
@@ -11621,7 +12052,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_usage_refresh_preserves_failed_reset_retry_key() {
+    fn plain_usage_refresh_clears_failed_reset_retry_key() {
         let mut state = test_state();
         let mut usage = usage_modal_with_reset_count(1, UsageAction::Redeem);
         usage.reset_idempotency_key = Some("retry-key".to_string());
@@ -11638,7 +12069,7 @@ mod tests {
         let Mode::Usage(usage) = &state.mode else {
             panic!("expected usage modal");
         };
-        assert_eq!(usage.reset_idempotency_key.as_deref(), Some("retry-key"));
+        assert!(usage.reset_idempotency_key.is_none());
     }
 
     #[tokio::test]
@@ -12147,9 +12578,18 @@ mod tests {
     }
 
     fn usage_response(reset_credits: i64) -> Value {
+        let credits = (reset_credits > 0).then(|| {
+            vec![serde_json::json!({
+                "id": "credit_1",
+                "status": "available",
+                "grantedAt": 1,
+                "expiresAt": 2,
+                "title": "Full reset"
+            })]
+        });
         serde_json::json!({
             "server": "work",
-            "rateLimitResetCredits": {"availableCount": reset_credits},
+            "rateLimitResetCredits": {"availableCount": reset_credits, "credits": credits},
             "rateLimits": {
                 "limitId": "codex",
                 "limitName": "Codex",
@@ -12182,7 +12622,56 @@ mod tests {
             message: None,
             selected,
             reset_idempotency_key: None,
+            selected_reset_credit: select_best_rate_limit_reset_credit(&usage_response(
+                reset_credits,
+            ))
+            .ok(),
         }
+    }
+
+    #[test]
+    fn local_search_filter_scan_accumulates_provider_matches_to_the_limit() {
+        let providers = vec!["target".to_string()];
+        let mut matches = Vec::new();
+        let mut first_page = serde_json::json!({
+            "data": [
+                { "thread": { "id": "skip", "cwd": "/work", "modelProvider": "other" } }
+            ],
+            "nextCursor": "page-2"
+        });
+        assert!(!append_local_search_matches(
+            &mut matches,
+            &mut first_page,
+            Some("/work"),
+            &providers,
+            2,
+        ));
+        assert!(matches.is_empty());
+        assert_eq!(first_page["nextCursor"], "page-2");
+
+        let mut second_page = serde_json::json!({
+            "data": [
+                { "thread": { "id": "target-1", "cwd": "/work", "modelProvider": "target" } },
+                { "thread": { "id": "other-cwd", "cwd": "/elsewhere", "modelProvider": "target" } },
+                { "thread": { "id": "target-2", "cwd": "/work", "modelProvider": "target" } }
+            ],
+            "nextCursor": "page-3"
+        });
+        assert!(append_local_search_matches(
+            &mut matches,
+            &mut second_page,
+            Some("/work"),
+            &providers,
+            2,
+        ));
+        matches.truncate(2);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|item| item["thread"]["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["target-1", "target-2"]
+        );
     }
 
     fn test_thread_row(id: &str, status: &str) -> ThreadRow {

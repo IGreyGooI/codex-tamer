@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::cli::SortKey;
+use crate::cli::{SortKey, ThreadSourceKind};
 use crate::tui::state::StreamStatus;
 use crate::tui::state::{BrowserSource, DetailState, MessageBlock, ThreadRow};
 
@@ -13,6 +13,8 @@ pub(crate) struct BrowserQuery {
     pub since: Option<i64>,
     pub cwd: Option<String>,
     pub archived: bool,
+    pub model_providers: Vec<String>,
+    pub source_kinds: Vec<ThreadSourceKind>,
     pub sort: Option<SortKey>,
     pub descending: bool,
     pub relative_updated: bool,
@@ -42,6 +44,7 @@ pub(crate) enum FetchRequest {
     ConsumeRateLimitReset {
         server: String,
         idempotency_key: String,
+        credit_id: String,
     },
 }
 
@@ -171,6 +174,16 @@ pub(crate) enum AppEvent {
         server: String,
         thread_id: String,
         archived: bool,
+        error: String,
+    },
+    ThreadDeleted {
+        server: String,
+        thread_id: String,
+        annotation_error: Option<String>,
+    },
+    ThreadDeleteFailed {
+        server: String,
+        thread_id: String,
         error: String,
     },
     RenameChanged {

@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
+use crate::rate_limit_reset::RateLimitResetCredit;
 use crate::tui::keymap::{
     BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_CONNECTED_HELP, DETAIL_HELP,
 };
@@ -37,6 +38,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 ..
             }
             | Mode::ConfirmArchive {
+                return_to_detail: true,
+                ..
+            }
+            | Mode::ConfirmDelete {
                 return_to_detail: true,
                 ..
             }
@@ -117,6 +122,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         } => {
             draw_confirm_archive(frame, area, thread_id, *archived);
         }
+        Mode::ConfirmDelete { thread_id, .. } => {
+            draw_confirm_delete(frame, area, thread_id);
+        }
         Mode::ConfirmOpenCodex { thread_id, cwd, .. } => {
             draw_confirm_open_codex(frame, area, thread_id, cwd);
         }
@@ -125,7 +133,12 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         }
         Mode::ConfirmRateLimitReset { usage, selected } => {
             draw_usage_modal(frame, area, usage);
-            draw_confirm_rate_limit_reset(frame, area, *selected);
+            draw_confirm_rate_limit_reset(
+                frame,
+                area,
+                usage.selected_reset_credit.as_ref(),
+                *selected,
+            );
         }
         Mode::NewSessionServerMenu {
             servers, selected, ..
@@ -776,6 +789,10 @@ fn draws_detail_background(state: &TuiState) -> bool {
                 return_to_detail: true,
                 ..
             }
+            | Mode::ConfirmDelete {
+                return_to_detail: true,
+                ..
+            }
             | Mode::ConfirmOpenCodex {
                 return_to_detail: true,
                 ..
@@ -964,16 +981,44 @@ fn compose_display_lines(value: &str, width: usize) -> Vec<Line<'static>> {
 
 fn draw_filter_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let value = if state.browser.archived { "on" } else { "off" };
-    draw_static_modal(
-        frame,
-        area,
-        "Filters",
-        &[
-            format!("archived: {value}"),
-            "a toggle archived".to_string(),
-            "Esc close".to_string(),
-        ],
-    );
+    let mut lines = vec![format!("archived: {value}")];
+    if !state.browser.model_providers.is_empty() {
+        lines.push(format!(
+            "providers: {}",
+            state.browser.model_providers.join(", ")
+        ));
+    }
+    if !state.browser.source_kinds.is_empty() {
+        lines.push(format!(
+            "sources: {}",
+            state
+                .browser
+                .source_kinds
+                .iter()
+                .map(|source| source_kind_label(*source))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines.extend(["a toggle archived".to_string(), "Esc close".to_string()]);
+    draw_static_modal(frame, area, "Filters", &lines);
+}
+
+fn source_kind_label(source: crate::cli::ThreadSourceKind) -> &'static str {
+    use crate::cli::ThreadSourceKind;
+
+    match source {
+        ThreadSourceKind::Cli => "cli",
+        ThreadSourceKind::VsCode => "vscode",
+        ThreadSourceKind::Exec => "exec",
+        ThreadSourceKind::AppServer => "app-server",
+        ThreadSourceKind::SubAgent => "sub-agent",
+        ThreadSourceKind::SubAgentReview => "sub-agent-review",
+        ThreadSourceKind::SubAgentCompact => "sub-agent-compact",
+        ThreadSourceKind::SubAgentThreadSpawn => "sub-agent-thread-spawn",
+        ThreadSourceKind::SubAgentOther => "sub-agent-other",
+        ThreadSourceKind::Unknown => "unknown",
+    }
 }
 
 fn draw_sort_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -1085,6 +1130,19 @@ fn draw_confirm_archive(frame: &mut Frame<'_>, area: Rect, thread_id: &str, arch
             format!("{verb} {thread_id}?"),
             format!("Enter {}", verb.to_lowercase()),
             "Esc cancel".to_string(),
+        ],
+    );
+}
+
+fn draw_confirm_delete(frame: &mut Frame<'_>, area: Rect, thread_id: &str) {
+    draw_static_modal(
+        frame,
+        area,
+        "Delete Thread",
+        &[
+            format!("Permanently delete {thread_id}?"),
+            "Spawned descendant threads will also be deleted.".to_string(),
+            "Enter delete, Esc cancel".to_string(),
         ],
     );
 }
@@ -1253,9 +1311,10 @@ fn draw_usage_actions(frame: &mut Frame<'_>, area: Rect, usage: &UsageModalState
 fn draw_confirm_rate_limit_reset(
     frame: &mut Frame<'_>,
     area: Rect,
+    credit: Option<&RateLimitResetCredit>,
     selected: ResetConfirmSelection,
 ) {
-    let area = centered_rect(area, 64, 8);
+    let area = centered_rect(area, 64, 10);
     frame.render_widget(Clear, area);
     let cancel_style = if selected == ResetConfirmSelection::Cancel {
         Style::default().fg(Color::Black).bg(Color::White)
@@ -1269,6 +1328,16 @@ fn draw_confirm_rate_limit_reset(
     };
     let lines = vec![
         Line::from("This consumes one banked Codex rate-limit reset."),
+        Line::from(format!(
+            "Selected: {}",
+            credit
+                .and_then(|credit| credit.title.as_deref())
+                .unwrap_or("rate-limit reset")
+        )),
+        Line::from(match credit.and_then(|credit| credit.expires_at) {
+            Some(expires_at) => format!("Expires at Unix time {expires_at}."),
+            None => "Does not expire.".to_string(),
+        }),
         Line::from(""),
         Line::from(vec![
             Span::styled(" Cancel ", cancel_style),
@@ -1291,7 +1360,14 @@ fn draw_confirm_rate_limit_reset(
 }
 
 fn draw_static_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String]) {
-    let height = (lines.len() as u16 + 2).max(5);
+    let content_width = usize::from(centered_rect(area, 70, 5).width.saturating_sub(2).max(1));
+    let content_height = lines
+        .iter()
+        .map(|line| textwrap::wrap(line, content_width).len().max(1))
+        .sum::<usize>();
+    let height = u16::try_from(content_height.saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .max(5);
     let area = centered_rect(area, 70, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1322,14 +1398,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  n new session (server, cwd, optional name, first message)  / search threads",
         "  l load selected thread",
         "  i interrupt selected active turn",
-        "  a annotate  e rename  A confirm archive/unarchive",
+        "  a annotate  e rename  A confirm archive/unarchive  D confirm delete",
         "  f filters  s sort  c columns/time/refresh  p preview  t auto-refresh",
         "",
         "Detail",
         "  Esc browser/detach detail session  Enter or m compose message or steer",
         "  gg/Home real transcript start  G/End real transcript end",
         "  / search loaded transcript  n/N next/previous match",
-        "  l load thread  o open in Codex TUI  a annotate  e rename  A confirm archive/unarchive",
+        "  l load thread  o open in Codex TUI  a annotate  e rename  A confirm archive/unarchive  D confirm delete",
         "  i interrupt",
         "",
         "Compose and Text Inputs",
@@ -1344,6 +1420,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Columns: t auto-refresh, -/+ refresh interval, a auto-attach",
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
         "  Archive confirmation: Enter archive/unarchive, Esc cancel",
+        "  Delete confirmation: Enter delete, Esc cancel",
         "  Open in Codex confirmation: Enter launch, Esc cancel",
         "  Usage: Tab/arrow select, Enter activate, Esc close; reset confirmation defaults to Cancel",
     ];
@@ -1409,6 +1486,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use crate::cli::ThreadSourceKind;
     use crate::tui::prefs::TuiPrefs;
     use crate::tui::state::{
         AccountUsageRow, ComposeState, DetailState, MessageBlock, MessageLine, MessageLineKind,
@@ -1513,6 +1591,72 @@ mod tests {
         state.browser.row_offset = 3;
         state.browser.clamp_row_offset(5);
         assert_eq!(state.browser.row_offset, 0);
+    }
+
+    #[test]
+    fn delete_confirmation_keeps_its_action_hint_when_thread_id_wraps() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::ConfirmDelete {
+            server: "work".to_string(),
+            thread_id: "019400f1-8a2b-7c3d-9e4f-5a6b7c8d9e0f".to_string(),
+            return_to_detail: false,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Enter delete, Esc cancel"));
+    }
+
+    #[test]
+    fn filter_menu_keeps_close_hint_when_source_filters_wrap() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::FilterMenu;
+        state.browser.source_kinds = vec![
+            ThreadSourceKind::SubAgent,
+            ThreadSourceKind::SubAgentReview,
+            ThreadSourceKind::SubAgentCompact,
+        ];
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("a toggle archived"));
+        assert!(text.contains("Esc close"));
     }
 
     #[test]
@@ -1740,6 +1884,7 @@ mod tests {
             loading: false,
             redeeming: false,
             snapshot: Some(AccountUsageSnapshot {
+                raw: serde_json::json!({}),
                 plan: "pro".to_string(),
                 credits: "42".to_string(),
                 limit_reached: "none".to_string(),
@@ -1757,6 +1902,7 @@ mod tests {
             message: Some("Codex rate limits reset.".to_string()),
             selected: UsageAction::Redeem,
             reset_idempotency_key: None,
+            selected_reset_credit: None,
         });
 
         let backend = TestBackend::new(140, 28);
@@ -1798,6 +1944,7 @@ mod tests {
                 loading: false,
                 redeeming: false,
                 snapshot: Some(AccountUsageSnapshot {
+                    raw: serde_json::json!({}),
                     plan: "pro".to_string(),
                     credits: "42".to_string(),
                     limit_reached: "none".to_string(),
@@ -1808,6 +1955,7 @@ mod tests {
                 message: None,
                 selected: UsageAction::Redeem,
                 reset_idempotency_key: None,
+                selected_reset_credit: None,
             },
             selected: ResetConfirmSelection::Cancel,
         };

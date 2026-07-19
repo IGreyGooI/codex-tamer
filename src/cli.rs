@@ -121,6 +121,10 @@ pub struct ListCommand {
     pub cwd: Option<String>,
     #[arg(long)]
     pub archived: bool,
+    #[arg(long = "provider", value_name = "PROVIDER")]
+    pub model_providers: Vec<String>,
+    #[arg(long = "source", value_enum)]
+    pub source_kinds: Vec<ThreadSourceKind>,
     #[arg(long = "parent", conflicts_with = "ancestor_thread")]
     pub parent_thread: Option<String>,
     #[arg(long = "ancestor", conflicts_with = "parent_thread")]
@@ -184,6 +188,10 @@ pub struct TuiCommand {
     pub cwd: Option<String>,
     #[arg(long)]
     pub archived: bool,
+    #[arg(long = "provider", value_name = "PROVIDER")]
+    pub model_providers: Vec<String>,
+    #[arg(long = "source", value_enum)]
+    pub source_kinds: Vec<ThreadSourceKind>,
     #[arg(long)]
     pub limit: Option<u32>,
     #[arg(long, value_enum)]
@@ -390,10 +398,17 @@ pub struct ModelsCommand {
 
 #[derive(Debug, Args)]
 pub struct UsageCommand {
-    #[command(flatten)]
-    pub server: ServerOpt,
-    #[arg(long)]
+    #[arg(long, global = true)]
+    pub server: Option<String>,
+    #[arg(long, global = true)]
     pub json: bool,
+    #[command(subcommand)]
+    pub action: Option<UsageSubcommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UsageSubcommand {
+    Redeem,
 }
 
 #[derive(Debug, Args)]
@@ -527,6 +542,23 @@ pub struct AnnotatePruneCommand {
 pub enum SortKey {
     Updated,
     Created,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadSourceKind {
+    Cli,
+    #[value(name = "vscode")]
+    #[serde(rename = "vscode")]
+    VsCode,
+    Exec,
+    AppServer,
+    SubAgent,
+    SubAgentReview,
+    SubAgentCompact,
+    SubAgentThreadSpawn,
+    SubAgentOther,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 
 use crate::annotations::{load_annotation, namespace_annotations};
-use crate::cli::{ItemsView, MessageRole, SortKey};
+use crate::cli::{ItemsView, MessageRole, SortKey, ThreadSourceKind};
 use crate::config::Target;
 use crate::errors::app_server_error;
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
@@ -20,6 +20,8 @@ pub struct ListThreadsRequest {
     pub since: Option<i64>,
     pub cwd: Option<String>,
     pub archived: bool,
+    pub model_providers: Vec<String>,
+    pub source_kinds: Vec<ThreadSourceKind>,
     pub parent_thread_id: Option<String>,
     pub ancestor_thread_id: Option<String>,
     pub sort: Option<SortKey>,
@@ -34,6 +36,7 @@ pub struct SearchThreadsRequest {
     pub cursor: Option<String>,
     pub since: Option<i64>,
     pub archived: bool,
+    pub source_kinds: Vec<ThreadSourceKind>,
 }
 
 #[derive(Debug)]
@@ -100,6 +103,12 @@ pub async fn list_threads(
     if request.archived {
         params.insert("archived".to_string(), json!(true));
     }
+    if !request.source_kinds.is_empty() {
+        params.insert("sourceKinds".to_string(), json!(request.source_kinds));
+    }
+    if !request.model_providers.is_empty() {
+        params.insert("modelProviders".to_string(), json!(request.model_providers));
+    }
     insert_opt(&mut params, "parentThreadId", request.parent_thread_id);
     insert_opt(&mut params, "ancestorThreadId", request.ancestor_thread_id);
     if let Some(cwd) = request.cwd {
@@ -147,6 +156,9 @@ pub async fn search_threads(
     params.insert("searchTerm".to_string(), json!(request.query));
     if request.archived {
         params.insert("archived".to_string(), json!(true));
+    }
+    if !request.source_kinds.is_empty() {
+        params.insert("sourceKinds".to_string(), json!(request.source_kinds));
     }
     let mut result = if let Some(since) = request.since {
         // `thread/search` does not send a sort key/direction, so the server's
@@ -219,6 +231,13 @@ pub async fn set_thread_name(
         "status": "accepted",
         "thread": result.get("thread").cloned().unwrap_or(Value::Null)
     }))
+}
+
+#[cfg(feature = "tui")]
+pub async fn delete_thread(client: &mut RpcClient, thread_id: &str) -> Result<Value> {
+    client
+        .request("thread/delete", json!({"threadId": thread_id}), |_| {})
+        .await
 }
 
 pub async fn read_thread_detail(

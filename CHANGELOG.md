@@ -4,12 +4,15 @@
 
 ### Added
 
-- Add repeatable `list` and `tui` provider/source thread filters, and a confirmed TUI-only thread delete action.
-- Add per-server, opt-in `usage redeem`, which automatically redeems the best detailed rate-limit reset credit; use the same deterministic selection in the TUI.
+- Add repeatable `list` and `tui` provider/source thread filters, and a confirmed TUI-only thread delete action
+  ([#11](https://github.com/kcosr/codex-threads/pull/11)).
+- Add per-server, opt-in `usage redeem`, which automatically redeems the best detailed rate-limit reset credit; use the same deterministic selection in the TUI
+  ([#11](https://github.com/kcosr/codex-threads/pull/11)).
 
 ### Fixed
 
-- Preserve a successful CLI reset redemption result when its follow-up usage refresh fails.
+- Preserve a successful CLI reset redemption result when its follow-up usage refresh fails
+  ([#11](https://github.com/kcosr/codex-threads/pull/11)).
 
 ## [0.2.2] - 2026-07-09
 

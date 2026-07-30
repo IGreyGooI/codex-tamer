@@ -5,24 +5,29 @@
 ### Breaking Changes
 
 - Replace `search QUERY` with the explicit `search threads QUERY` command
-  shape. The removed form is not retained as an alias.
+  shape. The removed form is not retained as an alias
+  ([#12](https://github.com/kcosr/codex-threads/pull/12)).
 
 ### Added
 
 - Add persisted Codex thread `pin` and `unpin` commands, `list --pinned` and
-  `list --unpinned` filters, and pin state in human list output.
+  `list --unpinned` filters, and pin state in human list output
+  ([#12](https://github.com/kcosr/codex-threads/pull/12)).
 - Add `CODEX_COMPATIBILITY.md` to record exact upstream Codex references,
   adopted app-server features, and reviewed follow-up candidates for each
-  integration update.
+  integration update
+  ([#12](https://github.com/kcosr/codex-threads/pull/12)).
 - Add `search messages THREAD_ID QUERY`, backed by Codex app-server's persisted
   `thread/searchOccurrences` API, with occurrence snippets and navigation
-  cursors in JSON output.
+  cursors in JSON output
+  ([#12](https://github.com/kcosr/codex-threads/pull/12)).
 
 ### Changed
 
 - Reject send and steer operations when a thread explicitly reports
   `canAcceptDirectInput: false`, including when that state is learned after an
-  automatic resume. Apply the same safeguard in the TUI composer.
+  automatic resume. Apply the same safeguard in the TUI composer
+  ([#12](https://github.com/kcosr/codex-threads/pull/12)).
 
 ## [0.2.3] - 2026-07-19
 

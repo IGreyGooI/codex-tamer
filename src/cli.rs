@@ -155,8 +155,6 @@ pub struct SearchCommand {
 pub enum SearchSubcommand {
     #[command(about = "Find candidate threads across one app-server")]
     Threads(SearchThreadsCommand),
-    #[command(about = "Find persisted message occurrences within one thread")]
-    Messages(SearchMessagesCommand),
 }
 
 #[derive(Debug, Args)]
@@ -172,20 +170,6 @@ pub struct SearchThreadsCommand {
     pub since: Option<String>,
     #[arg(long)]
     pub archived: bool,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct SearchMessagesCommand {
-    #[command(flatten)]
-    pub server: ServerOpt,
-    pub thread_id: String,
-    pub query: String,
-    #[arg(long)]
-    pub limit: Option<u32>,
-    #[arg(long)]
-    pub cursor: Option<String>,
     #[arg(long)]
     pub json: bool,
 }

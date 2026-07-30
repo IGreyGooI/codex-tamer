@@ -17,10 +17,6 @@
   adopted app-server features, and reviewed follow-up candidates for each
   integration update
   ([#12](https://github.com/kcosr/codex-threads/pull/12)).
-- Add `search messages THREAD_ID QUERY`, backed by Codex app-server's persisted
-  `thread/searchOccurrences` API, with occurrence snippets and navigation
-  cursors in JSON output
-  ([#12](https://github.com/kcosr/codex-threads/pull/12)).
 
 ### Changed
 

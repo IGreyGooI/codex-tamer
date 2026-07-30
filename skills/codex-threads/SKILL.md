@@ -60,7 +60,6 @@ codex-threads servers ping --json
 ```bash
 codex-threads list --limit 20
 codex-threads search threads "query" --limit 20
-codex-threads search messages <thread_id> "query" --limit 20
 codex-threads show <thread_id>
 codex-threads messages <thread_id>
 codex-threads status <thread_id>
@@ -145,13 +144,10 @@ codex-threads messages <thread_id> --last 4 --max-turns 50
 ```
 
 Use `search threads` to discover candidate threads across a server. Once the
-thread ID is known, use `search messages` to query Codex's persisted visible
-user messages and final assistant messages without relying on the bounded
-`messages --max-turns` scan. Message-search results are snippets, not a
-transcript: JSON occurrences include `turnId`, `itemId`, `snippet`,
-`snippetMatchRange`, and `turnCursor`. Pass `turnCursor` to
-`show <thread_id> --cursor <cursor>` for nearby exact history. Continue to use
-`messages` when the goal is readable recent conversation context.
+thread ID is known, use `messages` for readable recent context or `show` with
+cursors for exact persisted history. Do not attempt `search messages`: Codex
+0.146 only supports occurrence search for paginated-history threads, so the CLI
+does not expose that command yet.
 
 ### Message limit and filter semantics
 
@@ -278,9 +274,6 @@ codex-threads search threads "agent pack" --limit 20 --cursor "$(echo "$page1" |
 
 Use `--since` instead of paginating whenever the user asks about a recent time window.
 
-`search messages --json` also returns `nextCursor`. Pass it back to that same
-command to continue occurrence search within the selected thread.
-
 ### Thread history pagination
 
 For a small recent slice, prefer:
@@ -399,13 +392,6 @@ codex-threads search threads --limit 10 --json "query" \
   | jq '{results:[.results[] | {id:.thread.id,cwd:.thread.cwd,preview:.thread.preview,status:.thread.status.type,updatedAt:.thread.updatedAt,snippet:.snippet,annotation:.thread.annotation.text}]}'
 ```
 
-Persisted message occurrences:
-
-```bash
-codex-threads search messages <thread_id> --limit 20 --json "query" \
-  | jq '{occurrences:[.occurrences[] | {turnId,itemId,snippet,turnCursor}],nextCursor}'
-```
-
 Recent messages:
 
 ```bash
@@ -417,7 +403,6 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 
 - `list --json` returns `{ server, threads, nextCursor, backwardsCursor }`.
 - `search threads --json` returns `{ server, results, nextCursor, backwardsCursor }`; each result has `thread` and `snippet`.
-- `search messages --json` returns `{ server, threadId, query, occurrences, nextCursor }`; occurrences contain persisted match snippets and navigation IDs/cursors.
 - `show --json` returns `{ server, thread, turns }`; turns are under `.turns.data`.
 - When present, `list --json`, `search threads --json`, and `show --json` include `annotation` on thread objects.
 - Human `list` and `search threads` output includes a `PARENT ID` column when any displayed thread has `parentThreadId`; use `--json` for a stable shape.

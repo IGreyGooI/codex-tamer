@@ -24,12 +24,12 @@ use crate::errors::{ExitError, usage_error};
 use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
 use crate::rpc::RpcClient;
 use crate::session::{
-    ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchMessageOccurrencesRequest,
-    SearchThreadsRequest, ShowThreadRequest, ThreadForkOptions, ThreadProjection,
-    ThreadStartOptions, ThreadStatusRequest, fork_thread, is_thread_not_found_error, list_threads,
-    load_messages, loaded_status, read_thread_detail, request_with_direct_input_retry,
-    request_with_resume_retry, resume_thread_for_inspection, search_message_occurrences,
-    search_threads, start_thread, thread_id_from_fork, thread_id_from_start, thread_status,
+    ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
+    ShowThreadRequest, ThreadForkOptions, ThreadProjection, ThreadStartOptions,
+    ThreadStatusRequest, fork_thread, is_thread_not_found_error, list_threads, load_messages,
+    loaded_status, read_thread_detail, request_with_direct_input_retry, request_with_resume_retry,
+    resume_thread_for_inspection, search_threads, start_thread, thread_id_from_fork,
+    thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::turns::{
@@ -133,19 +133,6 @@ async fn run(cli: Cli) -> Result<i32> {
                     command.server.server.clone(),
                     |target, client| async move {
                         search_threads_command(target, client, command).await
-                    },
-                )
-                .await
-            }
-            SearchSubcommand::Messages(command) => {
-                with_client(
-                    &config,
-                    cli.connect.as_deref(),
-                    cli.connect_auth_token_env.as_deref(),
-                    cli.connect_auth_token.as_deref(),
-                    command.server.server.clone(),
-                    |target, client| async move {
-                        search_messages_command(target, client, command).await
                     },
                 )
                 .await
@@ -720,49 +707,6 @@ async fn search_threads_command(
         result,
         ThreadProjection::SearchResult,
     )
-}
-
-async fn search_messages_command(
-    target: Target,
-    mut client: RpcClient,
-    command: SearchMessagesCommand,
-) -> Result<i32> {
-    let result = search_message_occurrences(
-        &target,
-        &mut client,
-        SearchMessageOccurrencesRequest {
-            thread_id: command.thread_id,
-            query: command.query,
-            limit: command.limit.unwrap_or(DEFAULT_LIST_LIMIT),
-            cursor: command.cursor,
-        },
-    )
-    .await?;
-    if command.json {
-        print_json(&result)?;
-    } else {
-        let occurrences = result["occurrences"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        print_table(
-            &["SNIPPET", "TURN ID", "ITEM ID"],
-            occurrences
-                .iter()
-                .map(|occurrence| {
-                    vec![
-                        capped_cell(
-                            occurrence["snippet"].as_str().unwrap_or(""),
-                            THREAD_LABEL_WIDTH,
-                        ),
-                        table_cell(occurrence["turnId"].as_str().unwrap_or("")),
-                        table_cell(occurrence["itemId"].as_str().unwrap_or("")),
-                    ]
-                })
-                .collect(),
-        );
-    }
-    Ok(0)
 }
 
 async fn show_command(target: Target, mut client: RpcClient, command: ShowCommand) -> Result<i32> {

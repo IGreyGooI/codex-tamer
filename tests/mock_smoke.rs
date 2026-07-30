@@ -639,19 +639,6 @@ fn mock_result(
             paged_search_results(request)
         }
         "thread/search" => page(json!([{ "thread": sample_thread("thread_1"), "score": 1.0 }])),
-        "thread/searchOccurrences" => json!({
-            "data": [{
-                "turnId": "turn_1",
-                "itemId": "item_agent",
-                "snippet": "done with the release migration",
-                "snippetMatchRange": { "start": 14, "end": 21 },
-                "turnCursor": "turn_cursor_1"
-            }],
-            "nextCursor": request["params"]["cursor"]
-                .is_null()
-                .then_some(json!("occurrence_page_2"))
-                .unwrap_or(Value::Null)
-        }),
         "thread/read" => {
             let mut thread = sample_thread(thread_id(request));
             if thread_id(request) == "thread_read_only" {
@@ -2257,85 +2244,18 @@ fn search_since_filters_locally_across_server_pages() {
 }
 
 #[test]
-fn message_occurrence_search_returns_server_snippets_and_navigation_cursors() {
+fn message_occurrence_search_is_not_exposed_as_a_cli_command() {
     let server = MockServer::start();
-    let first_page = run_json(
-        &server,
-        &[
-            "search", "messages", "--server", "work", "--json", "--limit", "25", "thread_1",
-            "release",
-        ],
-    );
-    assert_eq!(
-        first_page,
-        json!({
-            "server": "work",
-            "threadId": "thread_1",
-            "query": "release",
-            "occurrences": [{
-                "turnId": "turn_1",
-                "itemId": "item_agent",
-                "snippet": "done with the release migration",
-                "snippetMatchRange": { "start": 14, "end": 21 },
-                "turnCursor": "turn_cursor_1"
-            }],
-            "nextCursor": "occurrence_page_2"
-        })
-    );
-    assert_eq!(
-        server.params_for("thread/searchOccurrences")[0],
-        json!({
-            "threadId": "thread_1",
-            "searchTerm": "release",
-            "cursor": null,
-            "limit": 25
-        })
-    );
-
-    let second_page = run_json(
-        &server,
-        &[
-            "search",
-            "messages",
-            "--server",
-            "work",
-            "--json",
-            "--limit",
-            "25",
-            "--cursor",
-            "occurrence_page_2",
-            "thread_1",
-            "release",
-        ],
-    );
-    assert_eq!(second_page["nextCursor"], Value::Null);
-    assert_eq!(
-        server.params_for("thread/searchOccurrences")[1],
-        json!({
-            "threadId": "thread_1",
-            "searchTerm": "release",
-            "cursor": "occurrence_page_2",
-            "limit": 25
-        })
-    );
-
-    let human = server
+    server
         .command()
-        .args([
-            "search", "messages", "--server", "work", "thread_1", "release",
-        ])
+        .args(["search", "messages", "thread_1", "release"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let text = String::from_utf8(human).expect("utf8");
-    assert!(text.contains("SNIPPET"));
-    assert!(text.contains("TURN ID"));
-    assert!(text.contains("ITEM ID"));
-    assert!(text.contains("done with the release migration"));
-    assert!(text.contains("turn_1"));
-    assert!(text.contains("item_agent"));
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "unrecognized subcommand 'messages'",
+        ));
+    assert!(server.params_for("thread/searchOccurrences").is_empty());
 }
 
 #[test]

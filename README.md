@@ -23,10 +23,9 @@ through a focused command-line interface.
 The main use cases are coordinating Codex work as a user or through another
 agent: list recent sessions/threads, retrieve relevant transcript slices,
 summarize status and where work left off, spawn new Codex threads for background
-work, and relay user requests or follow-ups across those threads. Search is
-split by intent: thread search discovers candidate sessions across a server,
-while persisted message-occurrence search finds matching snippets within one
-known thread without scanning a bounded transcript window.
+work, and relay user requests or follow-ups across those threads. Thread search
+discovers candidate sessions across a server; `messages` and `show` retrieve
+context from a selected thread.
 
 It talks to Codex app-server, the local control server exposed by the Codex
 agent runtime. In Codex terminology, a thread is one session and a turn is one
@@ -49,8 +48,8 @@ CLI as a safety boundary.
   debug targeting.
 - Deterministic target selection with `--server`, `CODEX_THREADS_SERVER`, or a
   single configured server.
-- Thread list, thread discovery, persisted message search, detail, status, and
-  flattened message history commands.
+- Thread list, thread discovery, detail, status, and flattened message history
+  commands.
 - Interactive TUI browser for listing, searching, viewing, annotating,
   refreshing, sending, steering, interrupting, and creating threads.
 - Local thread annotations projected into list, thread search, and detail
@@ -73,6 +72,11 @@ records reviewed features that were deferred.
 
 This is a reviewed API baseline, not a compatibility fallback: commands that
 depend on newer app-server methods will fail normally against an older server.
+
+Codex 0.146 includes `thread/searchOccurrences`, but only supports it for
+paginated-history threads while the app-server default remains legacy history.
+The implementation is retained internally for a future Codex release, but no
+message-occurrence search command is currently exposed.
 
 ## Screenshot
 
@@ -218,7 +222,6 @@ Find recent candidate threads, then inspect the selected thread:
 ```bash
 codex-threads list --since 24h --limit 20 --json
 codex-threads search threads "release process" --limit 10 --json
-codex-threads search messages THREAD_ID "migration" --limit 20 --json
 codex-threads messages THREAD_ID --role user --last 10 --max-turns 100
 codex-threads messages THREAD_ID --last 8 --max-turns 50
 ```
@@ -439,7 +442,6 @@ explicitly.
 | `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
 | `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--pinned` or `--unpinned`, repeatable `--provider` and `--source`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search threads QUERY` | Search threads on one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
-| `search messages THREAD_ID QUERY` | Search persisted visible user and final assistant messages within one thread. Supports `--limit` and `--cursor`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
 | `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, repeatable `--provider` and `--source`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
@@ -587,13 +589,6 @@ not `parentThreadId`. When displayed results include a pinned thread, human
 output also includes a `PINNED` column. JSON thread objects expose the
 app-server's `isPinned` field.
 
-`search messages --json` returns
-`{ server, threadId, query, occurrences, nextCursor }`. Each occurrence can
-include `turnId`, `itemId`, `snippet`, `snippetMatchRange`, and `turnCursor`.
-The match range uses UTF-16 code-unit offsets. Pass a returned `turnCursor` to
-`show THREAD_ID --cursor CURSOR` to continue inspecting the relevant turn
-history. Human output shows the snippet and its turn and item IDs.
-
 Blocking `new PROMPT` and `send` commands wait up to one hour for the turn to
 reach a terminal status. They consume realtime notifications when available and
 poll recent turns as a fallback so callers still get a final JSON response if a
@@ -669,11 +664,6 @@ to `updatedAt`. When a filtered list or thread search does not fill `--limit`
 from the first server page, the CLI keeps scanning server pages until the
 filtered limit is filled or the server cursor is exhausted. Returned cursors
 are still raw Codex server cursors from the last scanned page.
-
-`search messages` searches Codex's persisted visible user messages and final
-assistant messages within one thread. It returns match snippets and navigation
-cursors, not a transcript. Use `messages` when the goal is to retrieve readable
-recent conversation context.
 
 `messages` is a convenience projection over recent turn history. It does not
 page exact whole-thread message history and it does not have `--first`. For the

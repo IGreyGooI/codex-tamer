@@ -59,13 +59,17 @@ codex-threads servers ping --json
 
 ```bash
 codex-threads list --limit 20
-codex-threads search "query" --limit 20
+codex-threads search threads "query" --limit 20
+codex-threads search messages <thread_id> "query" --limit 20
 codex-threads show <thread_id>
 codex-threads messages <thread_id>
 codex-threads status <thread_id>
 codex-threads send <thread_id> "follow-up message"
 codex-threads new --cwd /abs/path "initial prompt"
 codex-threads fork <thread_id> --last-turn <turn_id>
+codex-threads list --pinned
+codex-threads pin <thread_id>
+codex-threads unpin <thread_id>
 codex-threads annotate get <thread_id>
 codex-threads annotate set <thread_id> "note"
 ```
@@ -73,6 +77,10 @@ codex-threads annotate set <thread_id> "note"
 Use `list --parent <thread_id>` for direct spawned child threads and
 `list --ancestor <thread_id>` for spawned descendants. These filters follow
 app-server `parentThreadId` spawn edges, not `forkedFromId` history forks.
+
+Use `list --pinned` or `list --unpinned` to filter the app-server's persisted
+pin state. `pin` and `unpin` change that Codex-owned state; unlike annotations,
+pins are not local `codex-threads` metadata.
 
 Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors, parent IDs, or reliable parsing.
 
@@ -101,10 +109,10 @@ codex-threads annotate search "review"
 `annotate list` and `annotate search` exit successfully with an empty result
 when there are no matches.
 
-Annotations appear automatically in `list`, `search`, and `show` output when
-present. In JSON, look for `thread.annotation.text`; in human `list` and
-`search`, an `ANNOTATION` column appears only when displayed rows have
-annotations.
+Annotations appear automatically in `list`, `search threads`, and `show`
+output when present. In JSON, look for `thread.annotation.text`; in human
+`list` and `search threads`, an `ANNOTATION` column appears only when displayed
+rows have annotations.
 
 Use prune only when intentionally cleaning stale local records:
 
@@ -121,7 +129,7 @@ reported missing. Archive/unarchive does not remove annotations.
 For an agent, prefer this split:
 
 1. **Discover with JSON.**
-   Use `list` or `search --json` to find candidate thread IDs and disambiguate by cwd/status/preview/snippet.
+   Use `list` or `search threads --json` to find candidate thread IDs and disambiguate by cwd/status/preview/snippet.
 2. **Read recent context with human output.**
    Once a thread is selected, use `messages` without `--json` for readable review of recent conversation context. Prefer `--last N` for the final number of messages to display and set `--max-turns M` high enough to scan the recent turn window you need.
 3. **Use JSON or `show` again for exact fields, older history, or pagination.**
@@ -130,11 +138,20 @@ For an agent, prefer this split:
 Example:
 
 ```bash
-codex-threads search --json --limit 10 "agent pack" \
+codex-threads search threads --json --limit 10 "agent pack" \
   | jq '{results:[.results[] | {id:.thread.id,cwd:.thread.cwd,status:.thread.status.type,updatedAt:.thread.updatedAt,preview:.thread.preview,snippet:.snippet}]}'
 
 codex-threads messages <thread_id> --last 4 --max-turns 50
 ```
+
+Use `search threads` to discover candidate threads across a server. Once the
+thread ID is known, use `search messages` to query Codex's persisted visible
+user messages and final assistant messages without relying on the bounded
+`messages --max-turns` scan. Message-search results are snippets, not a
+transcript: JSON occurrences include `turnId`, `itemId`, `snippet`,
+`snippetMatchRange`, and `turnCursor`. Pass `turnCursor` to
+`show <thread_id> --cursor <cursor>` for nearby exact history. Continue to use
+`messages` when the goal is readable recent conversation context.
 
 ### Message limit and filter semantics
 
@@ -238,9 +255,10 @@ Mention if a thread is currently active, blocked, waiting for review, or has an 
 
 The CLI is cursor-based, not numeric-offset-based. Do not invent offset numbers. Use returned cursors.
 
-### List/search pagination
+### List/thread-search pagination
 
-`list --json` and `search --json` return cursors such as `nextCursor` and `backwardsCursor`.
+`list --json` and `search threads --json` return cursors such as `nextCursor`
+and `backwardsCursor`.
 
 Fetch the next page by passing the cursor back:
 
@@ -254,11 +272,14 @@ codex-threads list --limit 20 --cursor "$(echo "$page1" | jq -r '.nextCursor')" 
 Search works similarly:
 
 ```bash
-page1=$(codex-threads search "agent pack" --limit 20 --json)
-codex-threads search "agent pack" --limit 20 --cursor "$(echo "$page1" | jq -r '.nextCursor')" --json
+page1=$(codex-threads search threads "agent pack" --limit 20 --json)
+codex-threads search threads "agent pack" --limit 20 --cursor "$(echo "$page1" | jq -r '.nextCursor')" --json
 ```
 
 Use `--since` instead of paginating whenever the user asks about a recent time window.
+
+`search messages --json` also returns `nextCursor`. Pass it back to that same
+command to continue occurrence search within the selected thread.
 
 ### Thread history pagination
 
@@ -304,6 +325,12 @@ codex-threads send <thread_id> "message" --no-wait --json
 Blocking sends wait up to one hour. If the local wait times out, the command exits with code `3` and the remote turn may still be running.
 
 If `send`, `steer`, or `settings set` sees Codex app-server's unloaded-thread error, it resumes/loads the thread and retries once. The resume uses yolo permissions by default unless global `--no-yolo` is passed.
+
+`send` and `steer` read `canAcceptDirectInput` before submission and check it
+again after an automatic resume. An explicit `false` means the thread is
+read-only and the command exits with code `3` without submitting input. The TUI
+uses the same safeguard. Absent or null capability data is unknown and does not
+block the action.
 
 Before sending, check status if there is any chance the thread is active:
 
@@ -368,8 +395,15 @@ codex-threads list --limit 20 --json \
 Search results:
 
 ```bash
-codex-threads search --limit 10 --json "query" \
+codex-threads search threads --limit 10 --json "query" \
   | jq '{results:[.results[] | {id:.thread.id,cwd:.thread.cwd,preview:.thread.preview,status:.thread.status.type,updatedAt:.thread.updatedAt,snippet:.snippet,annotation:.thread.annotation.text}]}'
+```
+
+Persisted message occurrences:
+
+```bash
+codex-threads search messages <thread_id> --limit 20 --json "query" \
+  | jq '{occurrences:[.occurrences[] | {turnId,itemId,snippet,turnCursor}],nextCursor}'
 ```
 
 Recent messages:
@@ -382,10 +416,11 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 ## Command Shape Notes
 
 - `list --json` returns `{ server, threads, nextCursor, backwardsCursor }`.
-- `search --json` returns `{ server, results, nextCursor, backwardsCursor }`; each result has `thread` and `snippet`.
+- `search threads --json` returns `{ server, results, nextCursor, backwardsCursor }`; each result has `thread` and `snippet`.
+- `search messages --json` returns `{ server, threadId, query, occurrences, nextCursor }`; occurrences contain persisted match snippets and navigation IDs/cursors.
 - `show --json` returns `{ server, thread, turns }`; turns are under `.turns.data`.
-- When present, `list --json`, `search --json`, and `show --json` include `annotation` on thread objects.
-- Human `list` and `search` output includes a `PARENT ID` column when any displayed thread has `parentThreadId`; use `--json` for a stable shape.
+- When present, `list --json`, `search threads --json`, and `show --json` include `annotation` on thread objects.
+- Human `list` and `search threads` output includes a `PARENT ID` column when any displayed thread has `parentThreadId`; use `--json` for a stable shape.
 - `messages --json` returns `{ server, threadId, messages, nextCursor, truncated }`.
 - `fork <thread_id> --json` returns `threadId`, `forkedFromThreadId`, optional `lastTurnId`, and applied model/effort/service tier fields.
 - Forked thread objects expose `forkedFromId`; `list --parent` and `list --ancestor` do not find forks.

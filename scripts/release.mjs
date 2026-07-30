@@ -20,6 +20,11 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+	requireCompatibilityFile,
+	updateCompatibilityForRelease,
+} from "./release-compatibility.mjs";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const PACKAGE_NAME = "codex-threads";
@@ -31,6 +36,7 @@ const VERSION_ARG = /^\d+\.\d+\.\d+$/;
 const cargoTomlPath = join(ROOT, "Cargo.toml");
 const cargoLockPath = join(ROOT, "Cargo.lock");
 const changelogPath = join(ROOT, "CHANGELOG.md");
+const compatibilityPath = join(ROOT, "CODEX_COMPATIBILITY.md");
 
 if (
 	!RELEASE_ARG ||
@@ -255,6 +261,15 @@ function updateChangelogForRelease(version) {
 	writeFileSync(changelogPath, content, "utf-8");
 }
 
+function validateCompatibilityForRelease() {
+	try {
+		requireCompatibilityFile(compatibilityPath);
+	} catch (error) {
+		console.error(`Error: ${error.message}`);
+		process.exit(1);
+	}
+}
+
 function extractReleaseNotes(version) {
 	const content = readFileSync(changelogPath, "utf-8");
 	const versionEscaped = escapeRegex(version);
@@ -291,6 +306,7 @@ ensureTools();
 ensureSyncedMain();
 ensureTagAvailable(version);
 validateChangelogForRelease(version);
+validateCompatibilityForRelease();
 run("cargo check");
 
 if (version !== currentVersion) {
@@ -299,9 +315,13 @@ if (version !== currentVersion) {
 }
 
 updateChangelogForRelease(version);
+const compatibilityUpdated = updateCompatibilityForRelease(compatibilityPath, version);
 const releaseCommitPaths = ["Cargo.toml", "CHANGELOG.md"];
 if (existsSync(cargoLockPath)) {
 	releaseCommitPaths.splice(1, 0, "Cargo.lock");
+}
+if (compatibilityUpdated) {
+	releaseCommitPaths.push("CODEX_COMPATIBILITY.md");
 }
 runFile("git", ["add", ...releaseCommitPaths]);
 runFile("git", ["commit", "-m", `Release v${version}`]);

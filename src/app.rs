@@ -24,10 +24,11 @@ use crate::errors::{ExitError, usage_error};
 use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
 use crate::rpc::RpcClient;
 use crate::session::{
-    ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
-    ShowThreadRequest, ThreadForkOptions, ThreadProjection, ThreadStartOptions,
-    ThreadStatusRequest, fork_thread, is_thread_not_found_error, list_threads, load_messages,
-    loaded_status, read_thread_detail, request_with_resume_retry, resume_thread_for_inspection,
+    ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchMessageOccurrencesRequest,
+    SearchThreadsRequest, ShowThreadRequest, ThreadForkOptions, ThreadProjection,
+    ThreadStartOptions, ThreadStatusRequest, fork_thread, is_thread_not_found_error, list_threads,
+    load_messages, loaded_status, read_thread_detail, request_with_direct_input_retry,
+    request_with_resume_retry, resume_thread_for_inspection, search_message_occurrences,
     search_threads, start_thread, thread_id_from_fork, thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
@@ -122,17 +123,34 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await
         }
-        Command::Search(command) => {
-            with_client(
-                &config,
-                cli.connect.as_deref(),
-                cli.connect_auth_token_env.as_deref(),
-                cli.connect_auth_token.as_deref(),
-                command.server.server.clone(),
-                |target, client| async move { search_command(target, client, command).await },
-            )
-            .await
-        }
+        Command::Search(command) => match command.command {
+            SearchSubcommand::Threads(command) => {
+                with_client(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                    |target, client| async move {
+                        search_threads_command(target, client, command).await
+                    },
+                )
+                .await
+            }
+            SearchSubcommand::Messages(command) => {
+                with_client(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                    |target, client| async move {
+                        search_messages_command(target, client, command).await
+                    },
+                )
+                .await
+            }
+        },
         Command::Show(command) => {
             with_client(
                 &config,
@@ -270,6 +288,28 @@ async fn run(cli: Cli) -> Result<i32> {
                 cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { name_command(target, client, command).await },
+            )
+            .await
+        }
+        Command::Pin(command) => {
+            with_client(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { pin_command(target, client, command, true).await },
+            )
+            .await
+        }
+        Command::Unpin(command) => {
+            with_client(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { pin_command(target, client, command, false).await },
             )
             .await
         }
@@ -637,6 +677,10 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
             since,
             cwd: command.cwd,
             archived: command.archived,
+            is_pinned: command
+                .pinned
+                .then_some(true)
+                .or(command.unpinned.then_some(false)),
             model_providers: command.model_providers,
             source_kinds: command.source_kinds,
             parent_thread_id: command.parent_thread,
@@ -650,10 +694,10 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
     emit_threads_result(&target, command.json, result, ThreadProjection::Direct)
 }
 
-async fn search_command(
+async fn search_threads_command(
     target: Target,
     mut client: RpcClient,
-    command: SearchCommand,
+    command: SearchThreadsCommand,
 ) -> Result<i32> {
     let since = command.since.as_deref().map(parse_since).transpose()?;
     let limit = command.limit.unwrap_or(DEFAULT_LIST_LIMIT);
@@ -676,6 +720,49 @@ async fn search_command(
         result,
         ThreadProjection::SearchResult,
     )
+}
+
+async fn search_messages_command(
+    target: Target,
+    mut client: RpcClient,
+    command: SearchMessagesCommand,
+) -> Result<i32> {
+    let result = search_message_occurrences(
+        &target,
+        &mut client,
+        SearchMessageOccurrencesRequest {
+            thread_id: command.thread_id,
+            query: command.query,
+            limit: command.limit.unwrap_or(DEFAULT_LIST_LIMIT),
+            cursor: command.cursor,
+        },
+    )
+    .await?;
+    if command.json {
+        print_json(&result)?;
+    } else {
+        let occurrences = result["occurrences"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        print_table(
+            &["SNIPPET", "TURN ID", "ITEM ID"],
+            occurrences
+                .iter()
+                .map(|occurrence| {
+                    vec![
+                        capped_cell(
+                            occurrence["snippet"].as_str().unwrap_or(""),
+                            THREAD_LABEL_WIDTH,
+                        ),
+                        table_cell(occurrence["turnId"].as_str().unwrap_or("")),
+                        table_cell(occurrence["itemId"].as_str().unwrap_or("")),
+                    ]
+                })
+                .collect(),
+        );
+    }
+    Ok(0)
 }
 
 async fn show_command(target: Target, mut client: RpcClient, command: ShowCommand) -> Result<i32> {
@@ -1143,7 +1230,7 @@ async fn steer_command(
     yolo: bool,
 ) -> Result<i32> {
     let params = json!({"threadId": command.thread_id, "expectedTurnId": command.turn_id, "input": [{"type": "text", "text": command.prompt, "textElements": []}]});
-    let result = request_with_resume_retry(
+    let result = request_with_direct_input_retry(
         &mut client,
         "turn/steer",
         params,
@@ -1203,6 +1290,29 @@ async fn archive_command(
         "server": target.server,
         "threadId": command.thread_id,
         "archived": archive,
+        "status": "accepted",
+        "thread": result.get("thread").cloned().unwrap_or(Value::Null)
+    });
+    emit_json_or_status(command.json, &output)
+}
+
+async fn pin_command(
+    target: Target,
+    mut client: RpcClient,
+    command: ThreadOnlyCommand,
+    pinned: bool,
+) -> Result<i32> {
+    let result = client
+        .request(
+            "thread/metadata/update",
+            json!({"threadId": command.thread_id, "isPinned": pinned}),
+            |_| {},
+        )
+        .await?;
+    let output = json!({
+        "server": target.server,
+        "threadId": command.thread_id,
+        "pinned": pinned,
         "status": "accepted",
         "thread": result.get("thread").cloned().unwrap_or(Value::Null)
     });
@@ -1874,6 +1984,13 @@ fn emit_threads_result(
                 .get("parentThreadId")
                 .is_some()
         });
+        let show_pinned = items.iter().any(|item| {
+            item.get("thread")
+                .unwrap_or(item)
+                .get("isPinned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
         let mut headers = match projection {
             ThreadProjection::Direct => vec!["UPDATED", "STATUS", "TITLE/PREVIEW"],
             ThreadProjection::SearchResult => {
@@ -1882,6 +1999,9 @@ fn emit_threads_result(
         };
         if show_annotations {
             headers.push("ANNOTATION");
+        }
+        if show_pinned {
+            headers.push("PINNED");
         }
         if show_parent_threads {
             headers.push("PARENT ID");
@@ -1907,6 +2027,13 @@ fn emit_threads_result(
                         thread["annotation"]["text"].as_str().unwrap_or(""),
                         ANNOTATION_WIDTH,
                     ));
+                }
+                if show_pinned {
+                    row.push(table_cell(if thread["isPinned"].as_bool() == Some(true) {
+                        "yes"
+                    } else {
+                        ""
+                    }));
                 }
                 if show_parent_threads {
                     row.push(table_cell(thread["parentThreadId"].as_str().unwrap_or("")));

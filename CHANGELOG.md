@@ -2,7 +2,27 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Breaking Changes
+
+- Replace `search QUERY` with the explicit `search threads QUERY` command
+  shape. The removed form is not retained as an alias.
+
+### Added
+
+- Add persisted Codex thread `pin` and `unpin` commands, `list --pinned` and
+  `list --unpinned` filters, and pin state in human list output.
+- Add `CODEX_COMPATIBILITY.md` to record exact upstream Codex references,
+  adopted app-server features, and reviewed follow-up candidates for each
+  integration update.
+- Add `search messages THREAD_ID QUERY`, backed by Codex app-server's persisted
+  `thread/searchOccurrences` API, with occurrence snippets and navigation
+  cursors in JSON output.
+
+### Changed
+
+- Reject send and steer operations when a thread explicitly reports
+  `canAcceptDirectInput: false`, including when that state is learned after an
+  automatic resume. Apply the same safeguard in the TUI composer.
 
 ## [0.2.3] - 2026-07-19
 

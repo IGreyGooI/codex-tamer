@@ -20,6 +20,7 @@ pub struct ListThreadsRequest {
     pub since: Option<i64>,
     pub cwd: Option<String>,
     pub archived: bool,
+    pub is_pinned: Option<bool>,
     pub model_providers: Vec<String>,
     pub source_kinds: Vec<ThreadSourceKind>,
     pub parent_thread_id: Option<String>,
@@ -37,6 +38,14 @@ pub struct SearchThreadsRequest {
     pub since: Option<i64>,
     pub archived: bool,
     pub source_kinds: Vec<ThreadSourceKind>,
+}
+
+#[derive(Debug)]
+pub struct SearchMessageOccurrencesRequest {
+    pub thread_id: String,
+    pub query: String,
+    pub limit: u32,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug)]
@@ -102,6 +111,9 @@ pub async fn list_threads(
     );
     if request.archived {
         params.insert("archived".to_string(), json!(true));
+    }
+    if let Some(is_pinned) = request.is_pinned {
+        params.insert("isPinned".to_string(), json!(is_pinned));
     }
     if !request.source_kinds.is_empty() {
         params.insert("sourceKinds".to_string(), json!(request.source_kinds));
@@ -184,6 +196,32 @@ pub async fn search_threads(
     };
     attach_thread_annotations(target, &mut result, ThreadProjection::SearchResult)?;
     Ok(result)
+}
+
+pub async fn search_message_occurrences(
+    target: &Target,
+    client: &mut RpcClient,
+    request: SearchMessageOccurrencesRequest,
+) -> Result<Value> {
+    let result = client
+        .request(
+            "thread/searchOccurrences",
+            json!({
+                "threadId": request.thread_id,
+                "searchTerm": request.query,
+                "cursor": request.cursor,
+                "limit": request.limit
+            }),
+            |_| {},
+        )
+        .await?;
+    Ok(json!({
+        "server": target.server,
+        "threadId": request.thread_id,
+        "query": request.query,
+        "occurrences": result["data"],
+        "nextCursor": result["nextCursor"]
+    }))
 }
 
 #[cfg(feature = "tui")]
@@ -605,8 +643,64 @@ pub async fn request_with_resume_retry<F>(
     params: Value,
     thread_id: &str,
     yolo: bool,
+    before_retry: impl FnMut(),
+    on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
+    request_with_resume_retry_inner(
+        client,
+        method,
+        params,
+        thread_id,
+        before_retry,
+        on_notification,
+        ResumeMode::Default { yolo },
+    )
+    .await
+}
+
+pub async fn request_with_direct_input_retry<F>(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    thread_id: &str,
+    yolo: bool,
+    before_retry: impl FnMut(),
+    on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
+    let read = client
+        .request(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+            |_| {},
+        )
+        .await?;
+    ensure_direct_input_allowed(&read, thread_id)?;
+    request_with_resume_retry_inner(
+        client,
+        method,
+        params,
+        thread_id,
+        before_retry,
+        on_notification,
+        ResumeMode::DirectInput { yolo },
+    )
+    .await
+}
+
+async fn request_with_resume_retry_inner<F>(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    thread_id: &str,
     mut before_retry: impl FnMut(),
     mut on_notification: F,
+    resume_mode: ResumeMode,
 ) -> Result<Value>
 where
     F: FnMut(Notification),
@@ -624,7 +718,16 @@ where
         Ok(result) => Ok(result),
         Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
             before_retry();
-            resume_thread_for_action(client, thread_id, yolo, /*exclude_turns*/ true).await?;
+            let resume = resume_thread_for_action(
+                client,
+                thread_id,
+                resume_mode.yolo(),
+                /*exclude_turns*/ true,
+            )
+            .await?;
+            if matches!(resume_mode, ResumeMode::DirectInput { .. }) {
+                ensure_direct_input_allowed(&resume, thread_id)?;
+            }
             client
                 .request(method, params, |notification| {
                     on_notification(notification);
@@ -632,6 +735,30 @@ where
                 .await
         }
         Err(err) => Err(err),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResumeMode {
+    Default { yolo: bool },
+    DirectInput { yolo: bool },
+}
+
+impl ResumeMode {
+    fn yolo(self) -> bool {
+        match self {
+            Self::Default { yolo } | Self::DirectInput { yolo } => yolo,
+        }
+    }
+}
+
+fn ensure_direct_input_allowed(response: &Value, thread_id: &str) -> Result<()> {
+    if response["thread"]["canAcceptDirectInput"].as_bool() == Some(false) {
+        Err(app_server_error(format!(
+            "thread `{thread_id}` does not accept direct input"
+        )))
+    } else {
+        Ok(())
     }
 }
 

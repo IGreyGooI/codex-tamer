@@ -721,6 +721,7 @@ async fn fetch_browser(
                     since: query.since,
                     cwd: query.cwd,
                     archived: query.archived,
+                    is_pinned: None,
                     model_providers: query.model_providers,
                     source_kinds: query.source_kinds,
                     parent_thread_id: None,
@@ -2692,6 +2693,10 @@ fn handle_new_session_title_input(key: KeyEvent, state: &mut TuiState, mut draft
 }
 
 fn open_message_action(state: &mut TuiState, server: String, thread_id: String) {
+    if thread_direct_input_denied(state, &server, &thread_id) {
+        state.set_notice(format!("thread {thread_id} does not accept direct input"));
+        return;
+    }
     let return_to_detail = matches!(state.mode, Mode::Detail);
     let (target, send_mode) = default_compose_target(state, server, thread_id, return_to_detail);
     state.mode = Mode::Compose(ComposeState {
@@ -3257,6 +3262,11 @@ fn submit_compose(
     let prompt = compose.text.trim().to_string();
     if prompt.is_empty() {
         state.mode = return_mode;
+        return;
+    }
+    if compose_target_direct_input_denied(state, &compose.target) {
+        state.mode = return_mode;
+        state.set_notice("thread does not accept direct input");
         return;
     }
     match compose.target {
@@ -5879,6 +5889,35 @@ fn active_thread_is_archived(state: &TuiState) -> bool {
     }
 }
 
+fn thread_direct_input_denied(state: &TuiState, server: &str, thread_id: &str) -> bool {
+    state
+        .browser
+        .rows
+        .iter()
+        .find(|row| row.server == server && row.id == thread_id)
+        .is_some_and(|row| {
+            row.raw
+                .get("thread")
+                .unwrap_or(&row.raw)
+                .get("canAcceptDirectInput")
+                .and_then(Value::as_bool)
+                == Some(false)
+        })
+}
+
+fn compose_target_direct_input_denied(state: &TuiState, target: &ComposeTarget) -> bool {
+    match target {
+        ComposeTarget::NewTurn { server, thread_id }
+        | ComposeTarget::Steer {
+            server, thread_id, ..
+        }
+        | ComposeTarget::SteerSelected { server, thread_id } => {
+            thread_direct_input_denied(state, server, thread_id)
+        }
+        ComposeTarget::NewThread { .. } => false,
+    }
+}
+
 fn active_annotation(state: &TuiState) -> Option<String> {
     match state.mode {
         Mode::Detail => state
@@ -7716,6 +7755,56 @@ mod tests {
         assert_eq!(pending.role, "user");
         assert_eq!(pending.turn_id, None);
         assert_eq!(message_text(pending), "test 2");
+    }
+
+    #[test]
+    fn submit_compose_rejects_thread_that_became_read_only() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Compose(ComposeState {
+            target: ComposeTarget::Steer {
+                server: "work".to_string(),
+                thread_id: "t1".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+            text: "steer here".to_string(),
+            send_mode: SendMode::Stream,
+            return_to_detail: true,
+        });
+        let mut row = test_thread_row("t1", "active");
+        row.raw["canAcceptDirectInput"] = serde_json::json!(false);
+        state.browser.rows = vec![row];
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+
+        let compose = match state.mode.clone() {
+            Mode::Compose(compose) => compose,
+            _ => unreachable!("compose mode"),
+        };
+        submit_compose(
+            &mut state,
+            compose,
+            &test_target(),
+            false,
+            &app_tx,
+            Mode::Detail,
+        );
+
+        assert!(matches!(state.mode, Mode::Detail));
+        assert!(
+            state
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.message == "thread does not accept direct input")
+        );
+        assert!(app_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -10844,6 +10933,49 @@ mod tests {
                 ..
             }) if thread_id == "t1"
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_message_action_rejects_explicitly_read_only_thread() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let mut row = test_thread_row("t1", "idle");
+        row.raw = serde_json::json!({
+            "id": "t1",
+            "canAcceptDirectInput": false,
+            "status": {"type": "idle"}
+        });
+        state.browser.rows = vec![row];
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(
+            state
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.message == "thread t1 does not accept direct input")
+        );
+        assert!(app_rx.try_recv().is_err());
     }
 
     #[tokio::test]

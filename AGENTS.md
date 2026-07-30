@@ -29,6 +29,8 @@ index.
 - Update `README.md` for user-facing behavior, config, command, output, or
   workflow changes.
 - Update `CHANGELOG.md` under `## [Unreleased]` for changes intended to ship.
+- Update `CODEX_COMPATIBILITY.md` with the exact upstream Codex tag and commit
+  whenever intentionally adopting app-server behavior from a new Codex release.
 - Keep CLI entrypoints thin; put behavior behind focused library modules.
 - Prefer deterministic offline tests for config, target resolution, protocol
   parsing, rendering, and error mapping.
@@ -95,3 +97,7 @@ then opens a new `## [Unreleased]` section for the next cycle.
 
 The `0.1.0` release used the historical `0.1.0` tag. Future script-driven
 releases use `vX.Y.Z` tags.
+
+For a release that includes a Codex API sync, the release script replaces the
+`CODEX_COMPATIBILITY.md` `Unreleased` row with the new `codex-threads` version
+and includes that file in the release commit.

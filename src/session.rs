@@ -20,6 +20,7 @@ pub struct ListThreadsRequest {
     pub since: Option<i64>,
     pub cwd: Option<String>,
     pub archived: bool,
+    pub is_pinned: Option<bool>,
     pub model_providers: Vec<String>,
     pub source_kinds: Vec<ThreadSourceKind>,
     pub parent_thread_id: Option<String>,
@@ -37,6 +38,15 @@ pub struct SearchThreadsRequest {
     pub since: Option<i64>,
     pub archived: bool,
     pub source_kinds: Vec<ThreadSourceKind>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Retained for a future Codex release with generally available paginated history.
+pub struct SearchMessageOccurrencesRequest {
+    pub thread_id: String,
+    pub query: String,
+    pub limit: u32,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug)]
@@ -102,6 +112,9 @@ pub async fn list_threads(
     );
     if request.archived {
         params.insert("archived".to_string(), json!(true));
+    }
+    if let Some(is_pinned) = request.is_pinned {
+        params.insert("isPinned".to_string(), json!(is_pinned));
     }
     if !request.source_kinds.is_empty() {
         params.insert("sourceKinds".to_string(), json!(request.source_kinds));
@@ -184,6 +197,47 @@ pub async fn search_threads(
     };
     attach_thread_annotations(target, &mut result, ThreadProjection::SearchResult)?;
     Ok(result)
+}
+
+#[allow(dead_code)] // Intentionally has no CLI caller until occurrence search supports normal threads.
+pub async fn search_message_occurrences(
+    target: &Target,
+    client: &mut RpcClient,
+    request: SearchMessageOccurrencesRequest,
+) -> Result<Value> {
+    let result = client
+        .request(
+            "thread/searchOccurrences",
+            occurrence_search_params(&request),
+            |_| {},
+        )
+        .await?;
+    Ok(occurrence_search_result(target, &request, &result))
+}
+
+#[allow(dead_code)]
+fn occurrence_search_params(request: &SearchMessageOccurrencesRequest) -> Value {
+    json!({
+        "threadId": request.thread_id,
+        "searchTerm": request.query,
+        "cursor": request.cursor,
+        "limit": request.limit
+    })
+}
+
+#[allow(dead_code)]
+fn occurrence_search_result(
+    target: &Target,
+    request: &SearchMessageOccurrencesRequest,
+    result: &Value,
+) -> Value {
+    json!({
+        "server": target.server,
+        "threadId": request.thread_id,
+        "query": request.query,
+        "occurrences": result["data"],
+        "nextCursor": result["nextCursor"]
+    })
 }
 
 #[cfg(feature = "tui")]
@@ -605,8 +659,64 @@ pub async fn request_with_resume_retry<F>(
     params: Value,
     thread_id: &str,
     yolo: bool,
+    before_retry: impl FnMut(),
+    on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
+    request_with_resume_retry_inner(
+        client,
+        method,
+        params,
+        thread_id,
+        before_retry,
+        on_notification,
+        ResumeMode::Default { yolo },
+    )
+    .await
+}
+
+pub async fn request_with_direct_input_retry<F>(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    thread_id: &str,
+    yolo: bool,
+    before_retry: impl FnMut(),
+    on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
+    let read = client
+        .request(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+            |_| {},
+        )
+        .await?;
+    ensure_direct_input_allowed(&read, thread_id)?;
+    request_with_resume_retry_inner(
+        client,
+        method,
+        params,
+        thread_id,
+        before_retry,
+        on_notification,
+        ResumeMode::DirectInput { yolo },
+    )
+    .await
+}
+
+async fn request_with_resume_retry_inner<F>(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    thread_id: &str,
     mut before_retry: impl FnMut(),
     mut on_notification: F,
+    resume_mode: ResumeMode,
 ) -> Result<Value>
 where
     F: FnMut(Notification),
@@ -624,7 +734,16 @@ where
         Ok(result) => Ok(result),
         Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
             before_retry();
-            resume_thread_for_action(client, thread_id, yolo, /*exclude_turns*/ true).await?;
+            let resume = resume_thread_for_action(
+                client,
+                thread_id,
+                resume_mode.yolo(),
+                /*exclude_turns*/ true,
+            )
+            .await?;
+            if matches!(resume_mode, ResumeMode::DirectInput { .. }) {
+                ensure_direct_input_allowed(&resume, thread_id)?;
+            }
             client
                 .request(method, params, |notification| {
                     on_notification(notification);
@@ -632,6 +751,30 @@ where
                 .await
         }
         Err(err) => Err(err),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResumeMode {
+    Default { yolo: bool },
+    DirectInput { yolo: bool },
+}
+
+impl ResumeMode {
+    fn yolo(self) -> bool {
+        match self {
+            Self::Default { yolo } | Self::DirectInput { yolo } => yolo,
+        }
+    }
+}
+
+fn ensure_direct_input_allowed(response: &Value, thread_id: &str) -> Result<()> {
+    if response["thread"]["canAcceptDirectInput"].as_bool() == Some(false) {
+        Err(app_server_error(format!(
+            "thread `{thread_id}` does not accept direct input"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -732,5 +875,162 @@ fn turn_status(turn: &Value) -> &'static str {
         "interrupted" => "interrupted",
         "failed" => "failed",
         _ => "inProgress",
+    }
+}
+
+#[cfg(test)]
+mod occurrence_search_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::Endpoint;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::UnixListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn request(cursor: Option<&str>) -> SearchMessageOccurrencesRequest {
+        SearchMessageOccurrencesRequest {
+            thread_id: "thread_1".to_string(),
+            query: "release".to_string(),
+            limit: 25,
+            cursor: cursor.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn retained_occurrence_search_uses_the_codex_0146_protocol_shape() {
+        assert_eq!(
+            occurrence_search_params(&request(Some("occurrence_page_2"))),
+            json!({
+                "threadId": "thread_1",
+                "searchTerm": "release",
+                "cursor": "occurrence_page_2",
+                "limit": 25
+            })
+        );
+    }
+
+    #[test]
+    fn retained_occurrence_search_preserves_snippets_and_navigation_cursors() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/codex.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let result = occurrence_search_result(
+            &target,
+            &request(None),
+            &json!({
+                "data": [{
+                    "turnId": "turn_1",
+                    "itemId": "item_agent",
+                    "snippet": "done with the release migration",
+                    "snippetMatchRange": { "start": 14, "end": 21 },
+                    "turnCursor": "turn_cursor_1"
+                }],
+                "nextCursor": "occurrence_page_2"
+            }),
+        );
+
+        assert_eq!(
+            result,
+            json!({
+                "server": "work",
+                "threadId": "thread_1",
+                "query": "release",
+                "occurrences": [{
+                    "turnId": "turn_1",
+                    "itemId": "item_agent",
+                    "snippet": "done with the release migration",
+                    "snippetMatchRange": { "start": 14, "end": 21 },
+                    "turnCursor": "turn_cursor_1"
+                }],
+                "nextCursor": "occurrence_page_2"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_occurrence_search_calls_the_expected_rpc_method() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket = temp.path().join("codex.sock");
+        let listener = UnixListener::bind(&socket).expect("bind mock socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut websocket = accept_async(stream).await.expect("websocket handshake");
+            while let Some(message) = websocket.next().await {
+                let Message::Text(text) = message.expect("websocket message") else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(&text).expect("JSON-RPC request");
+                let Some(id) = request["id"].as_i64() else {
+                    continue;
+                };
+                let method = request["method"].as_str().expect("method");
+                let result = match method {
+                    "initialize" => json!({
+                        "userAgent": "mock-codex",
+                        "codexHome": "/tmp/mock-codex",
+                        "platformFamily": "unix",
+                        "platformOs": "linux"
+                    }),
+                    "thread/searchOccurrences" => json!({
+                        "data": [{
+                            "turnId": "turn_1",
+                            "itemId": "item_agent",
+                            "snippet": "release"
+                        }],
+                        "nextCursor": null
+                    }),
+                    _ => panic!("unexpected RPC method: {method}"),
+                };
+                websocket
+                    .send(Message::Text(
+                        json!({ "id": id, "result": result }).to_string().into(),
+                    ))
+                    .await
+                    .expect("send response");
+                if method == "thread/searchOccurrences" {
+                    return request;
+                }
+            }
+            panic!("client disconnected before occurrence search");
+        });
+
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: socket.clone(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut client = RpcClient::connect(&target.endpoint)
+            .await
+            .expect("connect client");
+        let result = search_message_occurrences(&target, &mut client, request(None))
+            .await
+            .expect("search occurrences");
+        let observed = server.await.expect("mock server");
+
+        assert_eq!(
+            observed,
+            json!({
+                "id": 2,
+                "method": "thread/searchOccurrences",
+                "params": {
+                    "threadId": "thread_1",
+                    "searchTerm": "release",
+                    "cursor": null,
+                    "limit": 25
+                }
+            })
+        );
+        assert_eq!(result["occurrences"][0]["snippet"], "release");
+        assert_eq!(result["nextCursor"], Value::Null);
     }
 }

@@ -23,10 +23,9 @@ through a focused command-line interface.
 The main use cases are coordinating Codex work as a user or through another
 agent: list recent sessions/threads, retrieve relevant transcript slices,
 summarize status and where work left off, spawn new Codex threads for background
-work, and relay user requests or follow-ups across those threads. Search is
-available when you need it, but it is not optimized and can be very slow over
-large histories; prefer recent listing, targeted transcript retrieval, thread
-creation, and direct follow-ups when those fit the workflow.
+work, and relay user requests or follow-ups across those threads. Thread search
+discovers candidate sessions across a server; `messages` and `show` retrieve
+context from a selected thread.
 
 It talks to Codex app-server, the local control server exposed by the Codex
 agent runtime. In Codex terminology, a thread is one session and a turn is one
@@ -49,17 +48,35 @@ CLI as a safety boundary.
   debug targeting.
 - Deterministic target selection with `--server`, `CODEX_THREADS_SERVER`, or a
   single configured server.
-- Thread list, search, detail, status, and flattened message history commands.
+- Thread list, thread discovery, detail, status, and flattened message history
+  commands.
 - Interactive TUI browser for listing, searching, viewing, annotating,
   refreshing, sending, steering, interrupting, and creating threads.
-- Local thread annotations projected into list, search, and detail output.
+- Local thread annotations projected into list, thread search, and detail
+  output.
 - Thread creation with required `--cwd`.
 - Prompted `new` and `send` commands that wait by default, stream human output,
   and support JSON final output or newline-delimited JSON (NDJSON) streaming.
 - Model, reasoning effort, and service-tier settings where Codex app-server
   supports them.
 - Thread naming, archive/unarchive, TUI-only delete, active-turn steer/interrupt,
-  model listing, and goal get/set/clear.
+  pin/unpin, model listing, and goal get/set/clear.
+
+## Codex compatibility
+
+The current app-server integration has been reviewed through Codex application
+release 0.146, using the exact upstream reference recorded in
+[`CODEX_COMPATIBILITY.md`](CODEX_COMPATIBILITY.md). That file links each
+intentional Codex API review to the `codex-threads` release that adopted it and
+records reviewed features that were deferred.
+
+This is a reviewed API baseline, not a compatibility fallback: commands that
+depend on newer app-server methods will fail normally against an older server.
+
+Codex 0.146 includes `thread/searchOccurrences`, but only supports it for
+paginated-history threads while the app-server default remains legacy history.
+The implementation is retained internally for a future Codex release, but no
+message-occurrence search command is currently exposed.
 
 ## Screenshot
 
@@ -204,7 +221,7 @@ Find recent candidate threads, then inspect the selected thread:
 
 ```bash
 codex-threads list --since 24h --limit 20 --json
-codex-threads search "release process" --limit 10 --json
+codex-threads search threads "release process" --limit 10 --json
 codex-threads messages THREAD_ID --role user --last 10 --max-turns 100
 codex-threads messages THREAD_ID --last 8 --max-turns 50
 ```
@@ -423,8 +440,8 @@ explicitly.
 | --- | --- |
 | `servers [--json]` | List configured server aliases without connecting. |
 | `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
-| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, repeatable `--provider` and `--source`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
-| `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
+| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--pinned` or `--unpinned`, repeatable `--provider` and `--source`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
+| `search threads QUERY` | Search threads on one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
 | `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, repeatable `--provider` and `--source`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
@@ -437,6 +454,7 @@ explicitly.
 | `steer THREAD_ID TURN_ID PROMPT` | Send steering input to an active turn. |
 | `interrupt THREAD_ID TURN_ID` | Interrupt an active turn. |
 | `name THREAD_ID NAME` | Set a thread name. |
+| `pin THREAD_ID` / `unpin THREAD_ID` | Persist or clear a thread's Codex pin state. |
 | `archive THREAD_ID` / `unarchive THREAD_ID` | Archive or restore a thread. |
 | `models` | List available models from the app-server. |
 | `usage` | Show account usage, rate-limit windows, plan, and credits from the app-server. `usage redeem` redeems the best available reset credit only when permitted for the selected server. |
@@ -470,6 +488,12 @@ If `send`, `steer`, or `settings set` receives Codex app-server's unloaded
 thread error, `codex-threads` resumes the target thread and retries the action
 once. That resume uses the same permission mode as the action: yolo permissions
 by default, or app-server defaults when global `--no-yolo` is passed.
+
+Before sending or steering, the CLI reads the thread's
+`canAcceptDirectInput` capability. An explicit `false` rejects the action
+before submission; the capability is checked again after an automatic resume.
+The TUI applies the same rule before opening and submitting its composer.
+Absent or null capability data is treated as unknown, not as a rejection.
 
 `--effort` accepts any non-empty Codex app-server reasoning effort string.
 Built-in completion suggestions are `none`, `minimal`, `low`, `medium`, `high`,
@@ -558,9 +582,12 @@ prompt creates the thread and returns `threadId`; `fork THREAD_ID` returns the
 new `threadId` and `forkedFromThreadId`; `--stream` and `--no-wait` are invalid
 without a prompt.
 
-Human `list` and `search` output includes a `PARENT ID` column when any displayed
-thread has `parentThreadId`; use `--json` for a stable machine-readable shape.
-Forked threads expose `forkedFromId` in thread objects, not `parentThreadId`.
+Human `list` and `search threads` output includes a `PARENT ID` column when any
+displayed thread has `parentThreadId`; use `--json` for a stable
+machine-readable shape. Forked threads expose `forkedFromId` in thread objects,
+not `parentThreadId`. When displayed results include a pinned thread, human
+output also includes a `PINNED` column. JSON thread objects expose the
+app-server's `isPinned` field.
 
 Blocking `new PROMPT` and `send` commands wait up to one hour for the turn to
 reach a terminal status. They consume realtime notifications when available and
@@ -600,10 +627,10 @@ Annotations are keyed by selected server endpoint and thread ID. `annotate`
 commands can set, get, clear, list, search, and prune those local records.
 Deleting a thread in the TUI clears its root annotation; use `annotate prune` to
 remove any annotations left for deleted descendants.
-`list --json`, `search --json`, and `show --json` include an `annotation` object
-on returned thread objects when one exists. Human `list` and `search` add an
-`ANNOTATION` column only when displayed rows have annotations; human `show`
-prints the annotation in the thread detail.
+`list --json`, `search threads --json`, and `show --json` include an
+`annotation` object on returned thread objects when one exists. Human `list`
+and `search threads` add an `ANNOTATION` column only when displayed rows have
+annotations; human `show` prints the annotation in the thread detail.
 
 TUI preferences are local `codex-threads` state, separate from annotations:
 
@@ -630,13 +657,13 @@ Exit codes:
 | `3` | App-server, connection, Unix socket, WebSocket, or capability error. |
 | `130` | Local Ctrl-C while waiting on a turn; the remote turn may still be running. |
 
-`list --since`, `search --since`, and `messages --since` accept either an epoch
-timestamp in seconds or a relative duration ending in `s`, `m`, `h`, or `d`,
-such as `5m`. List and search filtering is applied client-side to `updatedAt`.
-When a filtered list or search does not fill `--limit` from the first server
-page, the CLI keeps scanning server pages until the filtered limit is filled or
-the server cursor is exhausted. Returned cursors are still raw Codex server
-cursors from the last scanned page.
+`list --since`, `search threads --since`, and `messages --since` accept either
+an epoch timestamp in seconds or a relative duration ending in `s`, `m`, `h`,
+or `d`, such as `5m`. List and thread-search filtering is applied client-side
+to `updatedAt`. When a filtered list or thread search does not fill `--limit`
+from the first server page, the CLI keeps scanning server pages until the
+filtered limit is filled or the server cursor is exhausted. Returned cursors
+are still raw Codex server cursors from the last scanned page.
 
 `messages` is a convenience projection over recent turn history. It does not
 page exact whole-thread message history and it does not have `--first`. For the
@@ -727,7 +754,8 @@ Set `RUN_ARCHIVE=1` to include live archive/unarchive checks.
 
 ## Release
 
-Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
+Releases are driven from `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and the
+reviewed upstream baseline in `CODEX_COMPATIBILITY.md`.
 Use `patch`, `minor`, `major`, or an explicit semantic version:
 
 ```bash
@@ -737,9 +765,10 @@ node scripts/release.mjs major
 node scripts/release.mjs 0.2.3
 ```
 
-The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
-matching git tag, creates a GitHub release with notes from the changelog,
-then commits a fresh `Unreleased` section for the next cycle.
+The script stamps the changelog and any `Unreleased` compatibility row, commits
+`Release vX.Y.Z`, creates and pushes a matching git tag, creates a GitHub
+release with notes from the changelog, then commits a fresh changelog
+`Unreleased` section for the next cycle.
 
 Release archives are packaged separately after the GitHub release exists.
 Platform-specific build automation is environment-specific and should stay in
@@ -766,6 +795,7 @@ Each archive should contain one top-level directory named
 - `README.md`
 - `LICENSE`
 - `CHANGELOG.md`
+- `CODEX_COMPATIBILITY.md`
 - `config.example.toml`
 - `skills/`
 
@@ -780,7 +810,7 @@ STAGE="$(mktemp -d)"
 ROOT="codex-threads-${VERSION}-${PLATFORM}"
 mkdir -p "$STAGE/$ROOT"
 install -m 755 "$BINARY" "$STAGE/$ROOT/codex-threads"
-cp README.md LICENSE CHANGELOG.md config.example.toml "$STAGE/$ROOT/"
+cp README.md LICENSE CHANGELOG.md CODEX_COMPATIBILITY.md config.example.toml "$STAGE/$ROOT/"
 cp -R skills "$STAGE/$ROOT/"
 tar -C "$STAGE" -czf "${ROOT}.tar.gz" "$ROOT"
 rm -rf "$STAGE"
@@ -808,6 +838,7 @@ gh release upload "$RELEASE_TAG" \
 - `src/app.rs` - command orchestration and rendering.
 - `tests/` - deterministic binary-level mock smoke coverage.
 - `scripts/` - release automation.
+- `CODEX_COMPATIBILITY.md` - exact upstream Codex API review provenance.
 - `smoke/` - opt-in live smoke harness.
 - `skills/` - Codex skill guidance for using this CLI from other assistant
   sessions.

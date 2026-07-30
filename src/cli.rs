@@ -61,6 +61,8 @@ pub enum Command {
     Steer(SteerCommand),
     Interrupt(InterruptCommand),
     Name(NameCommand),
+    Pin(ThreadOnlyCommand),
+    Unpin(ThreadOnlyCommand),
     Archive(ThreadOnlyCommand),
     Unarchive(ThreadOnlyCommand),
     Models(ModelsCommand),
@@ -121,6 +123,10 @@ pub struct ListCommand {
     pub cwd: Option<String>,
     #[arg(long)]
     pub archived: bool,
+    #[arg(long, conflicts_with = "unpinned")]
+    pub pinned: bool,
+    #[arg(long, conflicts_with = "pinned")]
+    pub unpinned: bool,
     #[arg(long = "provider", value_name = "PROVIDER")]
     pub model_providers: Vec<String>,
     #[arg(long = "source", value_enum)]
@@ -141,6 +147,18 @@ pub struct ListCommand {
 
 #[derive(Debug, Args)]
 pub struct SearchCommand {
+    #[command(subcommand)]
+    pub command: SearchSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SearchSubcommand {
+    #[command(about = "Find candidate threads across one app-server")]
+    Threads(SearchThreadsCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct SearchThreadsCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     pub query: String,

@@ -628,12 +628,24 @@ fn mock_result(
                     .unwrap_or("thread_parent")
             )
         ])),
+        "thread/list" if request["params"]["isPinned"].as_bool() == Some(true) => {
+            page(json!([sample_pinned_thread("thread_pinned")]))
+        }
+        "thread/list" if request["params"]["isPinned"].as_bool() == Some(false) => {
+            page(json!([sample_thread("thread_unpinned")]))
+        }
         "thread/list" => page(json!([sample_thread("thread_1")])),
         "thread/search" if request["params"]["searchTerm"].as_str() == Some("paged") => {
             paged_search_results(request)
         }
         "thread/search" => page(json!([{ "thread": sample_thread("thread_1"), "score": 1.0 }])),
-        "thread/read" => json!({ "thread": sample_thread(thread_id(request)) }),
+        "thread/read" => {
+            let mut thread = sample_thread(thread_id(request));
+            if thread_id(request) == "thread_read_only" {
+                thread["canAcceptDirectInput"] = json!(false);
+            }
+            json!({ "thread": thread })
+        }
         "thread/turns/list" => page(json!([sample_turn()])),
         "thread/start" => json!({
             "thread": sample_thread("thread_new"),
@@ -651,17 +663,29 @@ fn mock_result(
             "serviceTier": request["params"].get("serviceTier").cloned().unwrap_or(Value::Null)
         }),
         "thread/name/set" => json!({}),
+        "thread/metadata/update" => {
+            let mut thread = sample_thread(thread_id(request));
+            thread["isPinned"] = request["params"]["isPinned"].clone();
+            json!({ "thread": thread })
+        }
         "turn/start" if malformed_turn_start => {
             json!({ "turn": { "status": "inProgress", "items": [] } })
         }
         "turn/start" => json!({ "turn": { "id": "turn_1", "status": "inProgress", "items": [] } }),
-        "thread/resume" => json!({
-            "threadId": thread_id(request),
-            "model": "gpt-5.1-codex",
-            "reasoningEffort": "medium",
-            "serviceTier": Value::Null,
-            "cwd": "/tmp/mock-work"
-        }),
+        "thread/resume" => {
+            let mut thread = sample_thread(thread_id(request));
+            if thread_id(request) == "thread_denied_after_resume" {
+                thread["canAcceptDirectInput"] = json!(false);
+            }
+            json!({
+                "thread": thread,
+                "threadId": thread_id(request),
+                "model": "gpt-5.1-codex",
+                "reasoningEffort": "medium",
+                "serviceTier": Value::Null,
+                "cwd": "/tmp/mock-work"
+            })
+        }
         "thread/unsubscribe" => json!({}),
         "thread/settings/update" => json!({}),
         "thread/loaded/list" => page(json!(["thread_1"])),
@@ -900,6 +924,12 @@ fn sample_thread_with_updated(id: &str, updated_at: i64) -> Value {
 fn sample_thread_with_parent(id: &str, parent_id: &str) -> Value {
     let mut thread = sample_thread(id);
     thread["parentThreadId"] = json!(parent_id);
+    thread
+}
+
+fn sample_pinned_thread(id: &str) -> Value {
+    let mut thread = sample_thread(id);
+    thread["isPinned"] = json!(true);
     thread
 }
 
@@ -1556,8 +1586,10 @@ fn read_only_commands_return_scriptable_json() {
         "thread_1"
     );
     assert_eq!(
-        run_json(&server, &["search", "--server", "work", "--json", "mock"])["results"][0]["thread"]
-            ["id"],
+        run_json(
+            &server,
+            &["search", "threads", "--server", "work", "--json", "mock"]
+        )["results"][0]["thread"]["id"],
         "thread_1"
     );
     assert_eq!(
@@ -1716,7 +1748,7 @@ fn annotations_project_into_list_search_and_show_outputs() {
     let searched = run_json_with_state(
         &server,
         &state,
-        &["search", "--server", "work", "--json", "mock"],
+        &["search", "threads", "--server", "work", "--json", "mock"],
     );
     assert_eq!(
         searched["results"][0]["thread"]["annotation"]["text"],
@@ -2194,6 +2226,7 @@ fn search_since_filters_locally_across_server_pages() {
         &server,
         &[
             "search",
+            "threads",
             "--server",
             "work",
             "--json",
@@ -2208,6 +2241,21 @@ fn search_since_filters_locally_across_server_pages() {
     assert_eq!(output["results"][0]["thread"]["id"], "thread_new_1");
     assert_eq!(output["results"][1]["thread"]["id"], "thread_new_2");
     assert_eq!(output["nextCursor"], "page3");
+}
+
+#[test]
+fn message_occurrence_search_is_not_exposed_as_a_cli_command() {
+    let server = MockServer::start();
+    server
+        .command()
+        .args(["search", "messages", "thread_1", "release"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "unrecognized subcommand 'messages'",
+        ));
+    assert!(server.params_for("thread/searchOccurrences").is_empty());
 }
 
 #[test]
@@ -2279,6 +2327,37 @@ fn list_passes_provider_and_source_filters() {
         params[0]["sourceKinds"],
         json!(["subAgent", "subAgentReview"])
     );
+}
+
+#[test]
+fn list_filters_pinned_state_and_marks_pinned_human_rows() {
+    let server = MockServer::start();
+    let pinned = run_json(&server, &["list", "--server", "work", "--json", "--pinned"]);
+    assert_eq!(pinned["threads"][0]["id"], "thread_pinned");
+    assert_eq!(pinned["threads"][0]["isPinned"], true);
+
+    let unpinned = run_json(
+        &server,
+        &["list", "--server", "work", "--json", "--unpinned"],
+    );
+    assert_eq!(unpinned["threads"][0]["id"], "thread_unpinned");
+
+    let output = server
+        .command()
+        .args(["list", "--server", "work", "--pinned"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.lines().next().unwrap_or("").contains("PINNED"));
+    assert!(text.contains("yes"));
+
+    let params = server.params_for("thread/list");
+    assert_eq!(params[0]["isPinned"], true);
+    assert_eq!(params[1]["isPinned"], false);
+    assert_eq!(params[2]["isPinned"], true);
 }
 
 #[test]
@@ -2655,7 +2734,10 @@ fn golden_json_output_shapes_are_stable() {
     );
 
     assert_eq!(
-        run_json(&server, &["search", "--server", "work", "--json", "mock"]),
+        run_json(
+            &server,
+            &["search", "threads", "--server", "work", "--json", "mock"],
+        ),
         json!({
             "server": "work",
             "results": [
@@ -2974,6 +3056,65 @@ fn send_resumes_not_loaded_thread_before_retrying_turn_start() {
 }
 
 #[test]
+fn direct_input_capability_blocks_send_and_steer_before_submission() {
+    let server = MockServer::start();
+    server
+        .command()
+        .args([
+            "send",
+            "--server",
+            "work",
+            "--no-wait",
+            "thread_read_only",
+            "continue",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread `thread_read_only` does not accept direct input",
+        ));
+    server
+        .command()
+        .args([
+            "steer",
+            "--server",
+            "work",
+            "thread_read_only",
+            "turn_1",
+            "adjust",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread `thread_read_only` does not accept direct input",
+        ));
+    assert!(server.params_for("turn/start").is_empty());
+    assert!(server.params_for("turn/steer").is_empty());
+}
+
+#[test]
+fn direct_input_capability_is_rechecked_after_resume() {
+    let server = MockServer::start_requiring_resume_for_send();
+    server
+        .command()
+        .args([
+            "send",
+            "--server",
+            "work",
+            "--no-wait",
+            "thread_denied_after_resume",
+            "continue",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread `thread_denied_after_resume` does not accept direct input",
+        ));
+    assert_eq!(server.params_for("turn/start").len(), 1);
+    assert_eq!(server.params_for("thread/resume").len(), 1);
+}
+
+#[test]
 fn no_yolo_resume_retry_uses_app_server_permission_defaults() {
     let server = MockServer::start_requiring_resume_for_send();
     let accepted = run_json(
@@ -3211,6 +3352,15 @@ fn control_and_goal_commands_return_acknowledgements() {
         )["name"],
         "New name"
     );
+    let pinned = run_json(&server, &["pin", "--server", "work", "--json", "thread_1"]);
+    assert_eq!(pinned["pinned"], true);
+    assert_eq!(pinned["thread"]["isPinned"], true);
+    let unpinned = run_json(
+        &server,
+        &["unpin", "--server", "work", "--json", "thread_1"],
+    );
+    assert_eq!(unpinned["pinned"], false);
+    assert_eq!(unpinned["thread"]["isPinned"], false);
     assert_eq!(
         run_json(
             &server,
@@ -3224,6 +3374,15 @@ fn control_and_goal_commands_return_acknowledgements() {
     );
     assert_eq!(unarchived["archived"], false);
     assert_eq!(unarchived["thread"]["id"], "thread_1");
+    let metadata_params = server.params_for("thread/metadata/update");
+    assert_eq!(
+        metadata_params[0],
+        json!({"threadId": "thread_1", "isPinned": true})
+    );
+    assert_eq!(
+        metadata_params[1],
+        json!({"threadId": "thread_1", "isPinned": false})
+    );
     assert_eq!(
         run_json(
             &server,

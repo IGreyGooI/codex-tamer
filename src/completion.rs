@@ -427,6 +427,11 @@ mod tests {
             completion_candidates("r", &[String::from("usage")]),
             "redeem\n"
         );
+        assert_eq!(completion_candidates("m", &[String::from("search")]), "");
+        assert_eq!(
+            completion_candidates("t", &[String::from("search")]),
+            "threads\n"
+        );
     }
 
     #[test]

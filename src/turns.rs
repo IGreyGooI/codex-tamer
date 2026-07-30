@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::config::Target;
 use crate::errors::app_server_error;
 use crate::rpc::{Notification, RpcClient};
-use crate::session::request_with_resume_retry;
+use crate::session::request_with_direct_input_retry;
 #[cfg(feature = "tui")]
 use crate::session::resume_thread_for_action_with_notifications;
 
@@ -552,7 +552,7 @@ pub async fn steer_turn(
     yolo: bool,
 ) -> Result<Value> {
     let params = json!({"threadId": thread_id, "expectedTurnId": turn_id, "input": [{"type": "text", "text": prompt, "textElements": []}]});
-    let result = request_with_resume_retry(
+    let result = request_with_direct_input_retry(
         client,
         "turn/steer",
         params,
@@ -845,7 +845,7 @@ pub async fn start_turn(
     let params = Value::Object(params);
     let retry_notifications = early_notifications.clone();
     let captured_notifications = early_notifications.clone();
-    let result = request_with_resume_retry(
+    let result = request_with_direct_input_retry(
         client,
         "turn/start",
         params,

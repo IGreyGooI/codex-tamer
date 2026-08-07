@@ -1,162 +1,206 @@
-# codex-threads
+# codex-tamer
 
-`codex-threads` is a companion CLI for inspecting and controlling Codex
-app-server threads from a terminal or another agent.
+`codex-tamer` is a headless, Agent-facing CLI for inspecting and controlling
+Codex app-server threads. It is a frontend to Codex, not another Agent runtime:
+Codex app-server remains authoritative for threads, turns, history, models, and
+execution.
 
-> [!IMPORTANT]
-> `codex-threads` only sees threads on the Codex app-server instance it
-> connects to. This tool is built around running a shared, long-lived
-> `codex app-server --listen <socket>` (Unix domain socket or WebSocket),
-> pointing `codex-threads` at that socket, and starting interactive Codex TUI
-> sessions against the same socket with `codex --remote <socket>`. Codex
-> sessions started without `--remote` are not on that shared server, so
-> `codex-threads` cannot list, inspect, or control them — an empty thread list
-> usually means this setup is missing, not that something is broken. See
-> [Quickstart](#quickstart) for the full setup.
+This repository is an independent hard fork of
+[`kcosr/codex-threads`](https://github.com/kcosr/codex-threads), based on its
+`0.2.4` release. The fork intentionally removes the interactive TUI and focuses
+on a CLI plus packaged Skill that other Agents can invoke with JSON or NDJSON
+output.
 
-It exists for workflows the Codex CLI does not currently cover well: asking
-what threads were active recently, what happened in a repo, whether a thread is
-still running, and sending a follow-up to an existing session. The Codex desktop
-app may expose some of this interactively; `codex-threads` makes it available
-through a focused command-line interface.
+```text
+calling Agent
+    |
+    | argv + JSON/NDJSON
+    v
+codex-tamer
+    |
+    | Codex app-server JSON-RPC
+    v
+one named Unix-socket or WebSocket endpoint
+    |
+    +-- thread A / turn 1
+    +-- thread B / turn 7
+    +-- thread C / active turn
+```
 
-The main use cases are coordinating Codex work as a user or through another
-agent: list recent sessions/threads, retrieve relevant transcript slices,
-summarize status and where work left off, spawn new Codex threads for background
-work, and relay user requests or follow-ups across those threads. Thread search
-discovers candidate sessions across a server; `messages` and `show` retrieve
-context from a selected thread.
+`codex-tamer` has no TUI or web UI. It does not choose orchestration policy,
+schedule Agents, parse rollout files, or maintain a competing thread store.
 
-It talks to Codex app-server, the local control server exposed by the Codex
-agent runtime. In Codex terminology, a thread is one session and a turn is one
-user request/assistant response cycle.
+## Capabilities
 
-`codex-threads` is built for headless Codex control by users who already run
-Codex in yolo-style environments where sandboxing and approval policy are handled
-outside the Codex application. Yolo mode is opt-out: by default, thread
-creation, resume-before-action recovery, and turn start requests force Codex
-app-server to use `approvalPolicy = "never"` and full-access sandboxing
-(`sandbox = "danger-full-access"` or
-`sandboxPolicy.type = "dangerFullAccess"`). Pass global `--no-yolo` to use the
-app-server's configured approval and sandbox defaults instead. Do not use this
-CLI as a safety boundary.
+- Select one named Codex app-server endpoint per command.
+- List, search, inspect, and page Codex threads and turn history.
+- Read flattened user and assistant messages.
+- Create and fork threads.
+- Start turns, wait for completion, stream assistant output, or return after
+  acceptance.
+- Reattach to an accepted turn with `wait`, inspect its persisted `result`, or
+  follow normalized events as NDJSON.
+- Inject validated raw Responses API items into model-visible thread history
+  without starting a turn.
+- Discover an active turn, steer it, or interrupt it.
+- Read and change model, reasoning-effort, and service-tier settings where the
+  connected app-server supports them.
+- Name, pin, unpin, archive, and unarchive threads.
+- Read models, account usage, rate limits, and Codex thread goals.
+- Store endpoint-scoped local annotations for thread discovery.
+- Connect over Unix domain sockets or `ws://` / `wss://`, with optional bearer
+  authentication for WebSockets.
 
-## Features
+## Safety Model
 
-- TOML configuration for named app-server endpoints.
-- Direct `--connect unix:///path/to.sock` and `--connect ws://host:port`
-  debug targeting.
-- Deterministic target selection with `--server`, `CODEX_THREADS_SERVER`, or a
-  single configured server.
-- Thread list, thread discovery, detail, status, and flattened message history
-  commands.
-- Interactive TUI browser for listing, searching, viewing, annotating,
-  refreshing, sending, steering, interrupting, and creating threads.
-- Local thread annotations projected into list, thread search, and detail
-  output.
-- Thread creation with required `--cwd`.
-- Prompted `new` and `send` commands that wait by default, stream human output,
-  and support JSON final output or newline-delimited JSON (NDJSON) streaming.
-- Model, reasoning effort, and service-tier settings where Codex app-server
-  supports them.
-- Thread naming, archive/unarchive, TUI-only delete, active-turn steer/interrupt,
-  pin/unpin, model listing, and goal get/set/clear.
+By default, thread creation, resume-before-action recovery, and turn start
+requests force `approvalPolicy = "never"` and full-access sandboxing. This
+behavior is inherited from the upstream CLI and is called yolo mode.
 
-## Codex compatibility
+Use global `--no-yolo` to preserve the connected app-server's configured
+approval and sandbox defaults:
 
-The current app-server integration has been reviewed through Codex application
-release 0.146, using the exact upstream reference recorded in
-[`CODEX_COMPATIBILITY.md`](CODEX_COMPATIBILITY.md). That file links each
-intentional Codex API review to the `codex-threads` release that adopted it and
-records reviewed features that were deferred.
+```bash
+codex-tamer --no-yolo new --cwd "$PWD" "Inspect the repository" --json
+```
 
-This is a reviewed API baseline, not a compatibility fallback: commands that
-depend on newer app-server methods will fail normally against an older server.
+The headless client does not conduct an interactive approval conversation. If
+the app-server defaults require a server-initiated approval request, the
+operation can fail; configure a suitable noninteractive policy at the trusted
+endpoint instead of assuming the CLI will approve it.
 
-Codex 0.146 includes `thread/searchOccurrences`, but only supports it for
-paginated-history threads while the app-server default remains legacy history.
-The implementation is retained internally for a future Codex release, but no
-message-occurrence search command is currently exposed.
+Do not treat `codex-tamer` as a security boundary. A controlling Agent must
+select an appropriate workspace, sandbox, credentials, and endpoint before
+submitting work. Run concurrent write tasks in separate Git worktrees or other
+isolated working directories.
 
-## Screenshot
+## Compatibility
 
-<p align="center">
-  <img src="docs/assets/tui-screenshot.png" alt="codex-threads TUI showing thread list and transcript preview" width="520">
-</p>
+The inherited app-server integration was reviewed through Codex application
+release `0.146`. See [`CODEX_COMPATIBILITY.md`](CODEX_COMPATIBILITY.md) for the
+exact Codex tag and commit, the hard-fork baseline, and deferred APIs.
+
+This is a reviewed baseline, not a compatibility shim. Codex experimental APIs
+can change, and commands that rely on unsupported methods fail normally.
+`codex-tamer` requests `capabilities.experimentalApi = true` during
+`initialize`.
+
+## Prerequisites
+
+- A separate Codex CLI/runtime installation with `codex` on `PATH`.
+- A long-lived Codex app-server listening on a Unix socket or WebSocket.
+- Node.js 20 or newer to run the release-bundle installer.
+- Linux release bundles require glibc 2.34 or newer and the OpenSSL 3 shared
+  libraries (`libssl.so.3` and `libcrypto.so.3`); the release workflow checks
+  this ABI baseline on both Linux architectures.
+- Rust only when developing or building a release bundle.
+- `jq` only for the optional projection examples below.
+
+`codex-tamer` only sees threads served by the app-server it connects to. An
+empty list usually means the expected sessions are attached to another server.
 
 ## Install
 
-Download the latest archive for your platform from GitHub Releases:
+Release archives contain a prebuilt platform binary, the Agent Skill,
+`manifest.json`, and `install.mjs`. Recipients do not need Rust or the source
+checkout. For the private repository, authenticate `gh` before downloading a
+release asset:
+
+```bash
+gh auth status --hostname github.com
+gh release download TAG --repo IGreyGooI/codex-tamer \
+  --pattern 'codex-tamer-*-linux-x86_64.tar.gz*'
+sha256sum -c codex-tamer-*-linux-x86_64.tar.gz.sha256
+tar -xzf codex-tamer-*-linux-x86_64.tar.gz
+cd codex-tamer-*-linux-x86_64
+node install.mjs --json
+codex-tamer --version
+```
+
+The installer defaults to these per-user locations:
 
 ```text
-https://github.com/kcosr/codex-threads/releases
+~/.local/bin/codex-tamer
+~/.agents/skills/codex-tamer/
 ```
 
-Supported release platforms are currently:
+On Windows, the binary defaults to
+`%LOCALAPPDATA%\codex-tamer\bin\codex-tamer.exe`; the Skill remains under
+`%USERPROFILE%\.agents\skills\codex-tamer`. Use `--bin-dir` or `--skills-dir`
+to override either location. Windows supports `ws://` and `wss://` app-server
+endpoints; Unix-socket endpoints are rejected with a platform error.
 
-- `linux-x86_64`
-- `linux-arm64`
-- `macos-arm64`
-- `macos-x86_64`
+The installed Skill always invokes the stable command name `codex-tamer`.
+Installation never rewrites `SKILL.md` with an absolute binary path. If the
+selected binary directory is not on `PATH`, the installer reports the exact
+directory to add; restart Codex or the calling Agent after changing `PATH`.
 
-Install the extracted `codex-threads` binary somewhere on your `PATH`, for
-example `~/.local/bin`:
+To build the current platform bundle as a maintainer:
 
 ```bash
-mkdir -p ~/.local/bin
-install -m 755 codex-threads ~/.local/bin/codex-threads
-codex-threads help
+cargo build --release
+node scripts/package-release.mjs \
+  --binary target/release/codex-tamer \
+  --target linux-x86_64 \
+  --out-dir dist
 ```
 
-For unsupported platforms or local development, build from source in the
-Development section near the end of this document.
+The packaging command creates the extracted bundle directory, a `.tar.gz` or
+`.zip` archive, and an adjacent `.sha256` file. Supported target labels are
+`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64`, and
+`windows-x86_64`.
 
-## Quickstart
+Pushing a version tag runs the tag workflow in
+`.github/workflows/release-assets.yml`. It builds and tests all five targets,
+extracts and smoke-installs each packaged archive and unchanged Skill, verifies
+every adjacent checksum, creates `SHA256SUMS`, and publishes the GitHub Release
+with notes from the tagged `CHANGELOG.md` only after the full matrix succeeds.
+The workflow can resume a draft Release, but refuses to replace assets on an
+already-published Release.
 
-Prerequisites:
+The local release script runs Node test coverage plus the locked Rust test,
+lint, and release-build preflight before it creates a tag. It defaults to the
+`upstream` git remote; override only the remote name when needed. The selected
+remote's push URL must still resolve to `IGreyGooI/codex-tamer`:
 
-- Install the Codex CLI/runtime separately and ensure the `codex` executable is
-  on `PATH`.
-- Start Codex app-server with a Unix domain socket (UDS) or WebSocket listener
-  before using this CLI.
+```bash
+CODEX_TAMER_RELEASE_REMOTE=upstream node scripts/release.mjs patch
+```
 
-When asking another agent to use this CLI, point it at the included skill:
+The local script creates and pushes the release commit and tag; it leaves
+GitHub Release creation to the tag workflow.
+
+## Start Codex App-Server
+
+Start a shared local server:
+
+```bash
+CODEX_ENDPOINT=unix:///path/to/codex.sock
+codex app-server --listen "$CODEX_ENDPOINT"
+```
+
+Interactive Codex sessions that should be visible to `codex-tamer` must use the
+same server:
+
+```bash
+codex --remote "$CODEX_ENDPOINT" --cd "$PWD"
+```
+
+A direct endpoint is useful for a one-off check:
+
+```bash
+codex-tamer --connect "$CODEX_ENDPOINT" servers ping --json
+```
+
+## Configure Targets
+
+The default config path is:
 
 ```text
-skills/codex-threads
+~/.config/codex-tamer/config.toml
 ```
 
-`codex-threads` talks to a running Codex app-server:
-
-```bash
-CODEX_SOCK=unix:///path/to/codex.sock
-codex app-server --listen "$CODEX_SOCK"
-```
-
-`codex-threads` opts into Codex app-server experimental APIs during its
-JSON-RPC `initialize` request by sending `capabilities.experimentalApi = true`.
-No separate Codex feature flag is required in `codex-threads`. If the running
-Codex app-server is too old or rejects that capability, commands that depend on
-experimental methods fail with an app-server capability error.
-
-Interactive Codex CLI sessions that should be visible to `codex-threads` should
-connect to the same app-server with `--remote`:
-
-```bash
-codex --remote "$CODEX_SOCK" --cd "$PWD"
-```
-
-Without `--remote`, an interactive Codex CLI session may not be using the same
-app-server that `codex-threads` queries and controls.
-
-Use a direct socket when you do not want to create a config file:
-
-```bash
-codex-threads --connect "$CODEX_SOCK" models --json
-```
-
-For the common one-server case, configure one server at
-`~/.config/codex-threads/config.toml`:
+Configure one server to make it the implicit target:
 
 ```toml
 model = "gpt-5.5"
@@ -164,681 +208,314 @@ model_reasoning_effort = "high"
 
 [servers.main]
 endpoint = "unix:///path/to/codex.sock"
-
-# Opt in to `usage redeem` consuming banked Codex rate-limit reset credits on this server.
-# allow_rate_limit_reset = true
 ```
 
-See `config.example.toml` for a complete starting point.
-
-Then omit `--server`:
-
-```bash
-codex-threads servers ping
-codex-threads list
-codex-threads new --cwd "$PWD" "Run the tests"
-```
-
-Or configure named servers when you have multiple app-server sockets:
+Configure several independent endpoints when needed:
 
 ```toml
 [servers.main]
-endpoint = "unix:///path/to/main/codex.sock"
+endpoint = "unix:///path/to/main.sock"
 
 [servers.work]
 endpoint = "ws://127.0.0.1:8765"
 model = "gpt-5.5"
 model_reasoning_effort = "low"
-```
-
-Then run commands against a server:
-
-```bash
-codex-threads servers ping --server main
-codex-threads list --server main
-codex-threads new --server main --cwd "$PWD" "Run the tests"
-```
-
-Successful `servers ping` human output is tabular:
-
-```text
-SERVER  STATUS
-main    ok
-```
-
-This project targets Unix-like systems. Replace `/path/to/codex.sock` and
-`127.0.0.1:8765` examples with the endpoint you choose for your app-server.
-
-## Common Workflows
-
-The examples below assume `codex-threads` is installed on `PATH` and a server is
-configured or selected with `--connect`.
-
-Examples that pipe JSON use `jq`; install it separately or replace those
-pipelines with your preferred JSON tooling.
-
-Find recent candidate threads, then inspect the selected thread:
-
-```bash
-codex-threads list --since 24h --limit 20 --json
-codex-threads search threads "release process" --limit 10 --json
-codex-threads messages THREAD_ID --role user --last 10 --max-turns 100
-codex-threads messages THREAD_ID --last 8 --max-turns 50
-```
-
-Use `messages` for readable recent context. Use `show --items summary|full`
-when you need turn IDs, exact turn structure, or cursor-based paging:
-
-```bash
-codex-threads show THREAD_ID --last 10 --items summary --json
-codex-threads show THREAD_ID --asc --items full --json
-```
-
-Launch the interactive browser with the same initial filters:
-
-```bash
-codex-threads tui --since 24h --cwd "$PWD"
-codex-threads tui --query "release process" --limit 20
-```
-
-By default, `codex-threads tui` opens all configured servers and shows a
-`SERVER` column when more than one target is visible. Use `--server ALIAS` or
-`CODEX_THREADS_SERVER` to narrow the TUI to one server. `--connect` remains a
-single direct target.
-
-Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
-browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
-`?` for keyboard help, `/` to search threads or loaded transcript messages,
-`Enter` to open a thread, `p` to toggle the lazy recent-message preview pane,
-`[` and `]` to page browser results, `f` for filters, `s` for sort, `c` for
-visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
-to confirm archive or unarchive,
-`i` to confirm interrupting the selected active thread, `D` to confirm permanent deletion of
-the selected thread and its descendants, `r` to refresh, `y` to copy the active thread id
-with OSC 52, `o` to confirm opening the active thread in Codex's own TUI, and
-`u` to show Codex account usage. The usage modal shows plan, credits,
-reset-credit availability, and rate-limit windows for the active server; when
-banked reset credits are available, the `Redeem reset...` action opens a
-confirmation dialog that defaults to `Cancel` before calling Codex app-server's
-reset-credit redemption RPC. It selects the
-available detailed credit with the earliest expiry and shows that selection
-before confirming; it refuses to redeem when Codex cannot provide a selectable
-credit. Use
-`l` to explicitly load the selected or open thread, matching
-`status THREAD_ID --load`, then refresh visible metadata and history.
-In the browser, `n` creates a new session: pick the server when more than one
-is configured, confirm the working directory (prefilled from the selected
-thread, falling back to the TUI's launch directory), optionally name the
-session up front, then type the first message. The thread is created when the
-message is sent — `Esc` at any step cancels without creating anything — and
-the new row appears selected at the top while the first turn streams into the
-preview.
-Compose uses `Enter` to submit and `Ctrl-J` to insert a newline. On active
-threads, compose defaults to steering the active turn; `Tab` switches to a
-normal new-turn send, and `Tab` switches back to steer while the thread remains
-active. On inactive threads, `Tab` toggles stream/no-wait for new turns. Browser
-compose streams into the preview while the thread remains selected, follows
-queued turns on that thread, and detaches locally when selection moves away. If
-the initial selected browser row is active, or if an active thread is opened in
-detail, the TUI attaches to it automatically. Automatic attaching is governed
-by the persisted auto-attach toggle (`a` in the `c` menu, on by default): with
-it off, browsing shows content from history fetches only — no live stream is
-opened per selection — and only your own sends stream. While a stream is attached it is the sole content transport: status
-polling backs off entirely while turn notifications are flowing and only
-resumes as a fallback after a few quiet seconds. An animated green `live`
-indicator marks the attached stream in the detail header, the preview pane
-title, and the browser STATUS column.
-Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
-refresh interval from 5-300 seconds with `-` and `+`.
-Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
-uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
-and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
-operation. In detail, `i` confirms interrupt,
-`Enter` or `m` composes a message or steer action based on whether the thread is
-active, and `q` quits. Normal send uses Codex app-server's `turn/start` path;
-steer uses `turn/steer` when the thread is active and the composer is in steer
-mode. Attaching resumes the thread with turns included so the active-turn
-snapshot appears before new stream notifications; deltas that arrive while the
-snapshot is being fetched are trimmed against it, so attached transcripts
-continue from the snapshot without replaying text it already contains.
-Opening a thread loads a small recent turn window, orders it chronologically,
-and starts at the bottom of the transcript. Scrolling up at the top loads the
-next older chunk above the current transcript and preserves the current view. In
-detail, `gg` and `Home` load through to the real transcript start before jumping
-there; `G` and `End` load through to the real transcript end before jumping
-there. Detail views refresh in place while open, and `Esc` returns to the
-browser after unlinking the local detail view and detaching any local stream.
-Local detach leaves remote turns running.
-Opening in Codex temporarily returns terminal control to `codex resume
-<thread-id> --remote <server-endpoint> --cd <thread-cwd>`, adding
-`--dangerously-bypass-approvals-and-sandbox` when the codex-threads TUI was
-launched with yolo enabled, then redraws and refreshes the codex-threads TUI
-after Codex exits.
-Transcript rendering is markdown-aware for common headings, blockquotes, lists,
-paragraph spacing, and fenced code blocks. Message headings show role and
-timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
-spans when the default-off `tui-syntax-highlighting` Cargo feature is enabled.
-Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to append raw stream
-events while debugging live transcript rendering.
-Set `CODEX_THREADS_TURN_POLL_QUIET_SECS` (default 3, clamped to 1-300) to
-adjust how long a watched turn must stay silent before the fallback status
-poll runs while waiting on or attached to a turn.
-Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to additionally append every
-JSON-RPC frame exchanged with app-servers — one NDJSON line per frame with a
-millisecond timestamp, per-connection id, and direction (`send`/`recv`) — plus
-attach-time snapshot seeding and replay reconciliation decisions. This is the
-ground-truth capture for diagnosing streaming issues such as duplicated or
-missing transcript text; it can grow large and contains full thread content,
-so enable it only while reproducing a problem.
-
-## Configuration
-
-Default config path:
-
-```text
-~/.config/codex-threads/config.toml
-```
-
-Config path precedence:
-
-1. `--config PATH`
-2. `CODEX_THREADS_CONFIG`
-3. `~/.config/codex-threads/config.toml`
-
-Server target precedence for commands that target one app-server:
-
-1. `--connect unix:///path/to.sock`, `--connect ws://host:port`, or
-   `--connect wss://host:port`
-2. `--server ALIAS`
-3. `CODEX_THREADS_SERVER`
-4. The single configured server, only when exactly one server exists
-5. Error
-
-`--connect` bypasses configured servers and reports the endpoint URI as the
-`server` value in JSON output. It is mutually exclusive with `--server` and
-`CODEX_THREADS_SERVER`.
-
-The TUI is the exception to single-target defaulting: without `--server`,
-`CODEX_THREADS_SERVER`, or `--connect`, it opens every configured server and
-uses the server column to disambiguate rows. Browser paging cursors remain
-per-server, so the merged all-server browser starts with one page from each
-server; narrow with `--server` when you need cursor paging on one target.
-
-Configured servers use a single endpoint string:
-
-```toml
-[servers.main]
-endpoint = "unix:///path/to/codex.sock"
-
-[servers.local_ws]
-endpoint = "ws://127.0.0.1:8765"
-```
-
-`ws://` and `wss://` endpoints must include an explicit port and must not
-include a path, query, or fragment.
-
-Legacy UDS config still works, but prints a deprecation warning:
-
-```toml
-[servers.main]
-type = "uds"
-path = "/path/to/codex.sock"
-```
-
-Replace it with:
-
-```toml
-[servers.main]
-endpoint = "unix:///path/to/codex.sock"
-```
-
-WebSocket endpoints may use bearer-token auth. Prefer env-var indirection:
-
-```toml
-[servers.remote]
-endpoint = "wss://example.com:443"
 auth_token_env = "CODEX_APP_SERVER_TOKEN"
 ```
 
-Literal tokens are also supported for private configs:
+See [`config.example.toml`](config.example.toml) for the complete schema.
 
-```toml
-[servers.local_ws]
-endpoint = "ws://127.0.0.1:8765"
-auth_token = "literal-token"
+Target resolution is deterministic:
+
+1. Global `--connect ENDPOINT` selects that endpoint directly.
+2. Command `--server ALIAS` selects a configured server.
+3. `CODEX_TAMER_SERVER` selects a configured server.
+4. A config containing exactly one server selects it automatically.
+5. Otherwise the command exits with code `2` and requires an explicit target.
+
+`--connect` cannot be combined with `--server` or `CODEX_TAMER_SERVER`.
+Commands do not aggregate independent server results; `servers ping --all` is
+the explicit exception.
+
+The config path resolves in this order:
+
+1. Global `--config PATH`
+2. `CODEX_TAMER_CONFIG`
+3. `~/.config/codex-tamer/config.toml`
+
+## Agent Quickstart
+
+Install or point the controlling Agent at the packaged Skill:
+
+```text
+skills/codex-tamer
 ```
 
-For direct connections, use `--connect-auth-token-env ENV_VAR` or
-`--connect-auth-token TOKEN`. Prefer the env-var form on shared machines because
-literal command-line tokens may be visible through process listings. Both send
-`Authorization: Bearer <token>` during the WebSocket upgrade. Tokens are
-accepted only for `wss://` or loopback `ws://` endpoints; non-loopback plain
-`ws://` with a token is rejected to avoid
-sending credentials over cleartext.
+Use JSON for discovery and exact IDs:
 
-When more than one server is configured, app-server commands require an explicit
-target through `--server` or `CODEX_THREADS_SERVER`.
-This avoids cursor merging and prevents accidentally sending work to the wrong
-server. `servers ping --all` is the only aggregate command.
+```bash
+codex-tamer servers ping --json
+codex-tamer list --since 24h --limit 20 --json
+codex-tamer search threads "release process" --limit 10 --json
+```
 
-New-thread model defaults:
+Inspect one selected thread:
 
-1. `new --model MODEL` and `new --effort EFFORT`
-2. The selected server's `model` and `model_reasoning_effort`
-3. Top-level `model` and `model_reasoning_effort`
-4. Codex app-server defaults
+```bash
+codex-tamer status THREAD_ID --json
+codex-tamer messages THREAD_ID --last 8 --max-turns 50 --json
+codex-tamer show THREAD_ID --last 10 --items full --json
+```
 
-Config model defaults are applied only when creating a new root thread with
-`new`. Follow-up `send` commands keep the thread's existing app-server settings
-unless `--model` or `--effort` is passed explicitly. `fork` inherits the source
-thread settings unless `--model`, `--effort`, or `--service-tier` is passed
-explicitly.
+Create independent work:
 
-## Commands
+```bash
+codex-tamer new --cwd /absolute/worktree/path \
+  "Run the requested analysis" --no-wait --json
+```
 
-| Command | Purpose |
+Keep the returned IDs, then wait from any controlling process:
+
+```bash
+codex-tamer wait THREAD_ID TURN_ID --json
+```
+
+Send a blocking follow-up and receive the final result:
+
+```bash
+codex-tamer send THREAD_ID "Continue and report the result" --json
+```
+
+Check before writing to an active thread. Steer when input belongs to the
+current turn; use `send` when it should start a new turn:
+
+```bash
+status=$(codex-tamer status THREAD_ID --json)
+turn_id=$(printf '%s\n' "$status" | jq -r '.activeTurnId // empty')
+
+codex-tamer steer THREAD_ID "$turn_id" "Prioritize the failing test" --json
+codex-tamer interrupt THREAD_ID "$turn_id" --json
+```
+
+Independent threads can be controlled by separate `codex-tamer` processes.
+Avoid uncontrolled concurrent writers to the same thread or working tree.
+
+## Turn Modes
+
+`new` with a prompt and `send` wait for a terminal turn status by default, for
+up to one hour.
+
+```bash
+# One final JSON object after completion.
+codex-tamer send THREAD_ID "Return the result" --json
+
+# Return immediately after turn/start is accepted.
+codex-tamer send THREAD_ID "Run in the background" --no-wait --json
+
+# Emit accepted, progress, and terminal records as NDJSON.
+codex-tamer send THREAD_ID "Stream the result" --json --stream
+```
+
+`--no-wait` returns `server`, `threadId`, and `turnId`. Retain both IDs. A later
+controller can independently wait for terminal state, fetch the current
+persisted result, or follow normalized events:
+
+```bash
+codex-tamer wait THREAD_ID TURN_ID --timeout 3600 --json
+codex-tamer result THREAD_ID TURN_ID --json
+codex-tamer events follow THREAD_ID TURN_ID --timeout 3600
+```
+
+`wait` returns the same aggregate terminal shape as blocking `send`. `result`
+does not resume or subscribe to the thread; it cursor-pages through up to the
+newest 200 turns by default and can include an in-progress result. Increase
+`--max-turns` when the target is older. `events follow` writes NDJSON beginning
+with an `attached` record, replays persisted assistant content as
+`assistantMessage` records with `source = "snapshot"`, and then follows live or
+polled events through the terminal record. A local timeout or Ctrl-C does not
+imply that the remote turn stopped. Ctrl-C reports the selected server, thread,
+and turn on stderr before exiting `130`; a timeout reports an app-server error
+and exits `3`.
+
+Failed terminal results preserve Codex's structured `error` object when the
+server supplies one. Always use both the JSON `status` and the process exit
+code; do not reduce failures to assistant text alone.
+
+Use `inject` only when raw model-visible history is intentional. It calls
+Codex `thread/inject_items` and does not start a user turn:
+
+```bash
+codex-tamer inject THREAD_ID --items-file items.json --json
+printf '%s\n' '[{"type":"message","role":"user","content":[]}]' \
+  | codex-tamer inject THREAD_ID --items-file - --json
+```
+
+The input must be a non-empty JSON array of objects and is limited to 16 MiB.
+Use `send` or `steer` for ordinary instructions; injected items alter history
+semantics.
+
+Use `steer` only with the current `activeTurnId`:
+
+```bash
+codex-tamer steer THREAD_ID TURN_ID "Additional instruction" --json
+```
+
+Interrupt explicitly:
+
+```bash
+codex-tamer interrupt THREAD_ID TURN_ID --json
+```
+
+`send`, `steer`, and `settings set` retry once after the exact unloaded-thread
+error by resuming the thread. `send` and `steer` reject an explicit
+`canAcceptDirectInput: false` before submitting input.
+
+## Machine Output
+
+`--json` writes one command-specific JSON object to stdout for successful read,
+acknowledgement, no-wait, and blocking commands. Diagnostics and warnings go to
+stderr. `--json --stream` writes compact NDJSON records to stdout.
+
+Important output shapes include:
+
+| Command | JSON shape |
 | --- | --- |
-| `servers [--json]` | List configured server aliases without connecting. |
-| `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
-| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--pinned` or `--unpinned`, repeatable `--provider` and `--source`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
-| `search threads QUERY` | Search threads on one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
-| `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
-| `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, repeatable `--provider` and `--source`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
-| `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
-| `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
-| `fork THREAD_ID` | Fork a thread. Supports `--last-turn`, `--model`, `--effort`, `--service-tier`, `--name`, and `--json`. |
-| `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
-| `settings show THREAD_ID` | Read model, effort, service tier, and cwd. This resumes the thread for inspection but does not force yolo permissions. |
-| `settings set THREAD_ID` | Update `--model`, `--effort`, `--service-tier`, or `--clear-service-tier`; at least one setting flag is required. |
-| `status [THREAD_ID]` | Show server loaded-thread status or one thread with active turn discovery. Use `--load` with a thread ID to resume/load before reporting. |
-| `steer THREAD_ID TURN_ID PROMPT` | Send steering input to an active turn. |
-| `interrupt THREAD_ID TURN_ID` | Interrupt an active turn. |
-| `name THREAD_ID NAME` | Set a thread name. |
-| `pin THREAD_ID` / `unpin THREAD_ID` | Persist or clear a thread's Codex pin state. |
-| `archive THREAD_ID` / `unarchive THREAD_ID` | Archive or restore a thread. |
-| `models` | List available models from the app-server. |
-| `usage` | Show account usage, rate-limit windows, plan, and credits from the app-server. `usage redeem` redeems the best available reset credit only when permitted for the selected server. |
-| `goal get THREAD_ID` | Read the active goal. |
-| `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. |
-| `goal clear THREAD_ID` | Clear the active goal. |
-| `annotate set THREAD_ID TEXT` | Set or replace a local annotation for a thread. |
-| `annotate get THREAD_ID` | Read a local annotation. Missing annotations exit with code `2`. |
-| `annotate clear THREAD_ID` | Clear a local annotation. |
-| `annotate list` | List local annotations for the selected server, optionally filtered with `--query`. |
-| `annotate search QUERY` | Search local annotation text for the selected server. |
-| `annotate prune [--dry-run]` | Remove annotations whose threads are no longer found by app-server. |
-| `completion [SHELL]` | Print shell completion setup instructions for `bash`, `zsh`, or `fish`. |
+| `list` | `{ server, threads, nextCursor, backwardsCursor }` |
+| `search threads` | `{ server, results, nextCursor, backwardsCursor }` |
+| `show` | `{ server, thread, turns }` |
+| `messages` | `{ server, threadId, messages, nextCursor, truncated }` |
+| `status` | `{ server, reachable, loadedThreadIds, nextCursor }` |
+| `status THREAD_ID` | `{ server, threadId, thread, activeTurnId, truncated }` |
+| blocking `new` / `send` | `{ server, threadId, turnId, status, progress, assistantResponses, finalAssistantText }` |
+| no-wait `new` / `send` | `{ type, server, threadId, turnId, status }` |
+| `wait` | `{ server, threadId, turnId, status, progress, assistantResponses, finalAssistantText }` |
+| `result` | `{ server, threadId, turnId, status, assistantResponses, finalAssistantText, turn }` |
+| `events follow` | NDJSON `attached`, snapshot/live assistant, progress, and terminal records |
+| `inject` | `{ server, threadId, status, itemCount }` |
 
-`list --parent` and `list --ancestor` follow app-server spawn edges for
-subagent/side threads with `parentThreadId`. They do not list history forks;
-forks are identified by `forkedFromId` on returned thread objects and by
-`forkedFromThreadId` in `fork --json` output.
+The CLI does not currently expose a versioned JSON-RPC envelope to its caller;
+the table above is a command-specific CLI contract. Nested thread and turn
+objects retain fields supplied by the connected Codex version.
 
-Every app-server and annotation command accepts `--server ALIAS` and `--json`.
-Global
-`--config PATH`, `--connect ENDPOINT`, `--connect-auth-token-env ENV_VAR`, and
-`--connect-auth-token TOKEN` may be placed before or after the subcommand
-because they are global options.
-Global `--no-yolo` disables the default permission override for action commands
-that create, resume before action, or start Codex work. `settings show` is a
-read path and does not force yolo permissions even though it resumes the thread
-to inspect settings.
-
-If `send`, `steer`, or `settings set` receives Codex app-server's unloaded
-thread error, `codex-threads` resumes the target thread and retries the action
-once. That resume uses the same permission mode as the action: yolo permissions
-by default, or app-server defaults when global `--no-yolo` is passed.
-
-Before sending or steering, the CLI reads the thread's
-`canAcceptDirectInput` capability. An explicit `false` rejects the action
-before submission; the capability is checked again after an automatic resume.
-The TUI applies the same rule before opening and submitting its composer.
-Absent or null capability data is treated as unknown, not as a rejection.
-
-`--effort` accepts any non-empty Codex app-server reasoning effort string.
-Built-in completion suggestions are `none`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, `max`, and `ultra`. Accepted `goal set --status` values are `active`,
-`paused`, `blocked`, `usage-limited`, `budget-limited`, and `complete`.
-
-## Shell Completion
-
-Print setup instructions for the detected shell:
-
-```bash
-codex-threads completion
-codex-threads completion bash
-codex-threads completion zsh
-codex-threads completion fish
-```
-
-Enable completion only for the current shell:
-
-```bash
-source <(codex-threads completion script bash)
-source <(codex-threads completion script zsh)
-codex-threads completion script fish | source
-```
-
-For permanent bash setup, generate a static completion file and source it from
-`~/.bashrc`:
-
-```bash
-mkdir -p ~/.local/share/codex-threads
-codex-threads completion script bash > ~/.local/share/codex-threads/completion.bash
-printf '\nsource ~/.local/share/codex-threads/completion.bash\n' >> ~/.bashrc
-```
-
-For permanent zsh setup:
-
-```bash
-mkdir -p ~/.local/share/codex-threads
-codex-threads completion script zsh > ~/.local/share/codex-threads/completion.zsh
-printf '\nsource ~/.local/share/codex-threads/completion.zsh\n' >> ~/.zshrc
-```
-
-For permanent fish setup:
-
-```fish
-mkdir -p ~/.config/fish/completions
-codex-threads completion script fish > ~/.config/fish/completions/codex-threads.fish
-```
-
-Regenerate the completion file after upgrading `codex-threads`.
-
-Completions suggest command names, nested subcommands, option names, static
-values such as `--sort updated|created`, `--items summary|full|none`,
-`--role user|assistant`,
-known `--effort` values such as `none|minimal|low|medium|high|xhigh|max|ultra`,
-goal status values, shell names for `completion`, and local configured server
-aliases for `--server`. Completion does not connect to Codex app-server, so
-thread IDs, turn IDs, and remote model IDs are not completed.
-
-## Output
-
-Human output is the default and is intended for terminal use.
-
-`--json` emits a single pretty-printed JSON object for read commands,
-acknowledgement commands, `--no-wait` turn commands, and blocking turn
-commands. Blocking `new PROMPT --json` and `send --json` include:
-
-- `server`
-- `threadId`
-- `turnId`
-- `status`
-- `progress`
-- `assistantResponses`
-- `finalAssistantText`
-
-Streamed assistant progress events include Codex `itemId` when available, and
-`assistantResponses` contains one entry per assistant item so clients can keep
-separate assistant messages distinct.
-
-`--json --stream` is available for `new PROMPT` and `send`. It emits NDJSON:
-one accepted event, zero or more progress events, and one terminal event.
-
-Commands that create or start work always return enough follow-up identifiers:
-`server`, `threadId`, and `turnId` where applicable. `new --cwd PATH` without a
-prompt creates the thread and returns `threadId`; `fork THREAD_ID` returns the
-new `threadId` and `forkedFromThreadId`; `--stream` and `--no-wait` are invalid
-without a prompt.
-
-Human `list` and `search threads` output includes a `PARENT ID` column when any
-displayed thread has `parentThreadId`; use `--json` for a stable
-machine-readable shape. Forked threads expose `forkedFromId` in thread objects,
-not `parentThreadId`. When displayed results include a pinned thread, human
-output also includes a `PINNED` column. JSON thread objects expose the
-app-server's `isPinned` field.
-
-Blocking `new PROMPT` and `send` commands wait up to one hour for the turn to
-reach a terminal status. They consume realtime notifications when available and
-poll recent turns as a fallback so callers still get a final JSON response if a
-notification is missed.
-If the local one-hour wait times out, the command exits with code `3`; the
-remote Codex turn may still be running.
-
-`status --json` without a thread ID returns `{ server, reachable,
-loadedThreadIds, nextCursor }`. `status THREAD_ID --json` returns the selected
-thread, `threadId`, `activeTurnId`, and `truncated`. Plain `status THREAD_ID`
-does not resume unloaded threads; `status THREAD_ID --load` explicitly calls
-`thread/resume` with `excludeTurns: true`, unsubscribes the probing connection,
-then reports status from the loaded app-server view.
-
-`usage --json` returns `{ server, rateLimits, rateLimitsByLimitId,
-rateLimitResetCredits }` from Codex app-server's `account/rateLimits/read`
-response. Human output summarizes the server, plan, credits, reset-credit
-count, rate-limit reached state, and primary/secondary windows for each limit
-ID. The non-TUI `usage redeem` command is disabled by default and requires
-`allow_rate_limit_reset = true` under the selected `[servers.ALIAS]` table. It
-chooses the available detailed credit with the earliest expiry (then oldest
-grant time and ID for stable ties), sends that exact credit ID to Codex, and
-refuses when Codex does not provide enough detail to choose. Direct `--connect`
-targets cannot redeem reset credits. A successful redemption remains successful
-if the follow-up usage refresh fails; JSON output reports that condition in
-`refreshError`, while human output prints a warning.
-
-Annotations are local `codex-threads` state, not Codex app-server state. The
-state file is resolved as:
-
-1. `$CODEX_THREADS_STATE/annotations.json`
-2. `$XDG_STATE_HOME/codex-threads/annotations.json`
-3. `~/.local/state/codex-threads/annotations.json`
-
-Annotations are keyed by selected server endpoint and thread ID. `annotate`
-commands can set, get, clear, list, search, and prune those local records.
-Deleting a thread in the TUI clears its root annotation; use `annotate prune` to
-remove any annotations left for deleted descendants.
-`list --json`, `search threads --json`, and `show --json` include an
-`annotation` object on returned thread objects when one exists. Human `list`
-and `search threads` add an `ANNOTATION` column only when displayed rows have
-annotations; human `show` prints the annotation in the thread detail.
-
-TUI preferences are local `codex-threads` state, separate from annotations:
-
-1. `$CODEX_THREADS_STATE/tui.json`
-2. `$XDG_STATE_HOME/codex-threads/tui.json`
-3. `~/.local/state/codex-threads/tui.json`
-
-The TUI persists disposable UI preferences such as visible columns,
-auto-refresh, the 5-300 second refresh interval, preview pane, and default sort.
-Corrupt or unsupported preference files are renamed to
-`tui.json.corrupt.<epoch>` when possible and fall back to defaults instead of
-blocking launch. In search mode, `--cwd` and `--provider` are local refinements;
-the TUI scans server pages to find up to the requested limit of matching rows.
-Sort controls are disabled until the app-server search API supports server-side
-sorting.
+Stream records use `type` values such as `accepted`, `progress`,
+`assistantMessage`, `completed`, `failed`, and `interrupted`. Each emitted turn
+record includes `server`, `threadId`, and `turnId`; assistant records include an
+`itemId` when Codex supplies one.
 
 Exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Command succeeded, or a blocking turn completed. |
-| `1` | A blocking `new` or `send` turn reached `failed` or `interrupted`. |
+| `1` | A blocking turn reached `failed` or `interrupted`. |
 | `2` | Usage, argument, validation, configuration, or local lookup error. |
-| `3` | App-server, connection, Unix socket, WebSocket, or capability error. |
-| `130` | Local Ctrl-C while waiting on a turn; the remote turn may still be running. |
+| `3` | App-server, connection, socket, WebSocket, capability, or timeout error. |
+| `130` | Local Ctrl-C while waiting; the remote turn may still be running. |
 
-`list --since`, `search threads --since`, and `messages --since` accept either
-an epoch timestamp in seconds or a relative duration ending in `s`, `m`, `h`,
-or `d`, such as `5m`. List and thread-search filtering is applied client-side
-to `updatedAt`. When a filtered list or thread search does not fill `--limit`
-from the first server page, the CLI keeps scanning server pages until the
-filtered limit is filled or the server cursor is exhausted. Returned cursors
-are still raw Codex server cursors from the last scanned page.
+On codes `2`, `3`, and `130`, callers must inspect stderr. A streaming command
+can have already emitted valid NDJSON before a later transport or protocol
+error, so also check the process exit code.
 
-`messages` is a convenience projection over recent turn history. It does not
-page exact whole-thread message history and it does not have `--first`. For the
-beginning of a thread or older exact review, use `show --asc` and/or
-`show --cursor` with the appropriate `--items` view.
+## Command Reference
 
-Message selection order is:
+| Command | Purpose |
+| --- | --- |
+| `servers` | List configured endpoint aliases without connecting. |
+| `servers ping` | Check one target, or all configured targets with `--all`. |
+| `list` | List threads with cursor, time, cwd, pin, provider, source, and ancestry filters. |
+| `search threads QUERY` | Search thread metadata and previews. |
+| `show THREAD_ID` | Read thread metadata plus paged turns. |
+| `messages THREAD_ID` | Flatten a bounded recent turn scan into user/assistant messages. |
+| `new --cwd PATH [PROMPT]` | Create a thread and optionally its first turn. |
+| `fork THREAD_ID` | Fork through the full thread or `--last-turn TURN_ID`. |
+| `send THREAD_ID PROMPT` | Start a follow-up turn. |
+| `status [THREAD_ID]` | Inspect loaded threads or one thread and its active turn. |
+| `steer THREAD_ID TURN_ID PROMPT` | Add input to the expected active turn. |
+| `interrupt THREAD_ID TURN_ID` | Request interruption of an active turn. |
+| `settings show THREAD_ID` | Read effective cwd/model/effort/service tier. |
+| `settings set THREAD_ID` | Update model, effort, or service tier. |
+| `name THREAD_ID NAME` | Set the persisted thread name. |
+| `pin` / `unpin THREAD_ID` | Change persisted Codex pin state. |
+| `archive` / `unarchive THREAD_ID` | Change persisted archive state. |
+| `models` | List models exposed by app-server. |
+| `usage` | Read plan, credits, and rate limits. |
+| `usage redeem` | Consume one reset credit when enabled per server. |
+| `goal get/set/clear THREAD_ID` | Manage Codex-owned thread goal state. |
+| `annotate set/get/clear/list/search/prune` | Manage endpoint-scoped local notes. |
+| `completion` | Print shell completion instructions or scripts. |
 
-1. Fetch up to `--max-turns` recent turns from Codex with full items.
-2. Flatten those turns into user/assistant messages.
-3. Apply `--since`, if present, using the turn timestamp.
-4. Apply `--role user|assistant`, if present.
-5. Apply `--last N`, if present, to the final filtered message list.
+Run `codex-tamer COMMAND --help` for all flags and value constraints.
 
-`--max-turns` defaults to `200` and is the recent turn scan window, not a final
-display limit.
-`--last` is the final message limit after flattening and filtering; it is not
-an alias for `--max-turns`. Role filtering only sees messages inside the
-scanned recent turns, so increase `--max-turns` when looking for sparse or older
-messages such as `--role assistant --last 3`.
+## History and Pagination
 
-In human output, `messages` prints readable timestamped blocks. When no role
-filter is set, each block header includes the role. With `--role user` or
-`--role assistant`, the role is omitted from the header because every message
-has the requested role. `--json` keeps the structured message array shape.
-When the recent turn scan is truncated, human output prints a warning; increase
-`--max-turns` or use `show --cursor` for older exact paging.
-Long table cells and message previews may be shortened in human output to keep
-terminal output readable; use `--json` when exact text is required.
+`list`, `search threads`, and `show` use opaque server cursors. Pass returned
+cursor strings back exactly; do not interpret them as offsets or timestamps.
 
-## Development
-
-Build the CLI during development:
-
-```bash
-cargo build
-```
-
-Build the optimized binary:
+`messages --max-turns M` first scans the most recent `M` turns, then flattens
+messages, applies `--since` and `--role`, and finally applies `--last N`.
+`messages` has no `--first`; use `show --asc` and cursors for older history.
 
 ```bash
-cargo build --release
+page=$(codex-tamer show THREAD_ID --last 20 --items full --json)
+cursor=$(printf '%s\n' "$page" | jq -r '.turns.nextCursor // empty')
+codex-tamer show THREAD_ID --cursor "$cursor" --items full --json
 ```
 
-To use the local build like a release binary, install it somewhere on your
-`PATH`, for example:
+## Local Annotations
+
+Annotations are local `codex-tamer` state, not Codex app-server state. Their
+location resolves as:
+
+1. `$CODEX_TAMER_STATE/annotations.json`
+2. `$XDG_STATE_HOME/codex-tamer/annotations.json`
+3. `~/.local/state/codex-tamer/annotations.json`
+
+They are keyed by the selected endpoint and thread ID. `list`, `search
+threads`, and `show` project an annotation onto a thread when one exists.
 
 ```bash
-mkdir -p ~/.local/bin
-install -m 755 target/release/codex-threads ~/.local/bin/codex-threads
+codex-tamer annotate set THREAD_ID "Waiting for review" --json
+codex-tamer annotate search "review" --json
+codex-tamer annotate prune --dry-run --json
 ```
 
-You can also install directly from the checkout:
+Use `annotate prune` deliberately: without `--dry-run`, it removes local
+annotations whose threads app-server reports missing.
+
+## Completion
 
 ```bash
-cargo install --path . --root ~/.local
+codex-tamer completion
+source <(codex-tamer completion script bash)
+source <(codex-tamer completion script zsh)
+codex-tamer completion script fish | source
 ```
 
-Required checks:
+## Development and Verification
 
 ```bash
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features
 cargo build --release
+node --test scripts/*.test.mjs
 ```
 
-The integration smoke tests in `tests/mock_smoke.rs` start mock UDS and TCP
-WebSocket app-servers and exercise the compiled CLI binary end to end.
-
-The opt-in PTY smoke tests in `tests/tui_pty_smoke.rs` drive the real
-interactive TUI through a pseudo-terminal, including browser/detail navigation,
-streaming sends, attach/detach, and CLI history/status validation against a
-stateful mock app-server:
-
-```bash
-cargo test --test tui_pty_smoke -- --ignored
-```
-
-Live smoke checks are opt-in:
-
-```bash
-CODEX_ENDPOINT=unix:///path/to/codex.sock smoke/live_smoke.sh
-```
-
-Set `RUN_CODEX_TURN=1` to run a real model turn through the live app-server.
-Set `RUN_ARCHIVE=1` to include live archive/unarchive checks.
-
-## Release
-
-Releases are driven from `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and the
-reviewed upstream baseline in `CODEX_COMPATIBILITY.md`.
-Use `patch`, `minor`, `major`, or an explicit semantic version:
-
-```bash
-node scripts/release.mjs patch
-node scripts/release.mjs minor
-node scripts/release.mjs major
-node scripts/release.mjs 0.2.3
-```
-
-The script stamps the changelog and any `Unreleased` compatibility row, commits
-`Release vX.Y.Z`, creates and pushes a matching git tag, creates a GitHub
-release with notes from the changelog, then commits a fresh changelog
-`Unreleased` section for the next cycle.
-
-Release archives are packaged separately after the GitHub release exists.
-Platform-specific build automation is environment-specific and should stay in
-operator context, such as private agent-context notes or build-service wrappers,
-instead of this repository. This README is the source of truth for public
-archive names, contents, and upload layout.
-
-Supported release platforms currently use archive names like:
-
-```text
-codex-threads-VERSION-linux-x86_64.tar.gz
-codex-threads-VERSION-linux-arm64.tar.gz
-codex-threads-VERSION-macos-arm64.tar.gz
-codex-threads-VERSION-macos-x86_64.tar.gz
-```
-
-Each archive is a single-platform build output. Do not bundle multiple platform
-binaries into one archive.
-
-Each archive should contain one top-level directory named
-`codex-threads-VERSION-PLATFORM` with:
-
-- `codex-threads` - executable binary for that platform
-- `README.md`
-- `LICENSE`
-- `CHANGELOG.md`
-- `CODEX_COMPATIBILITY.md`
-- `config.example.toml`
-- `skills/`
-
-Example packaging flow for one platform:
-
-```bash
-VERSION=0.2.0
-PLATFORM=linux-x86_64
-BINARY=/path/to/codex-threads
-
-STAGE="$(mktemp -d)"
-ROOT="codex-threads-${VERSION}-${PLATFORM}"
-mkdir -p "$STAGE/$ROOT"
-install -m 755 "$BINARY" "$STAGE/$ROOT/codex-threads"
-cp README.md LICENSE CHANGELOG.md CODEX_COMPATIBILITY.md config.example.toml "$STAGE/$ROOT/"
-cp -R skills "$STAGE/$ROOT/"
-tar -C "$STAGE" -czf "${ROOT}.tar.gz" "$ROOT"
-rm -rf "$STAGE"
-```
-
-Repeat that staging step for each platform, using the correct binary for each
-target. After the GitHub Release exists, upload the archives:
-
-```bash
-RELEASE_TAG="v${VERSION}"
-gh release upload "$RELEASE_TAG" \
-  "codex-threads-${VERSION}-linux-x86_64.tar.gz" \
-  "codex-threads-${VERSION}-linux-arm64.tar.gz" \
-  "codex-threads-${VERSION}-macos-arm64.tar.gz" \
-  "codex-threads-${VERSION}-macos-x86_64.tar.gz"
-```
+Deterministic integration tests use mock Unix-socket and WebSocket app-servers.
+Opt-in live checks are documented in [`smoke/README.md`](smoke/README.md).
 
 ## Project Structure
 
-- `src/bin/` - binary entrypoints.
-- `src/lib.rs` - shared library entrypoint.
-- `src/config.rs` - TOML schema, validation, and target resolution.
-- `src/rpc.rs` - Unix domain socket WebSocket JSON-RPC transport and handshake.
-- `src/cli.rs` - command-line parser.
-- `src/app.rs` - command orchestration and rendering.
-- `tests/` - deterministic binary-level mock smoke coverage.
-- `scripts/` - release automation.
-- `CODEX_COMPATIBILITY.md` - exact upstream Codex API review provenance.
-- `smoke/` - opt-in live smoke harness.
-- `skills/` - Codex skill guidance for using this CLI from other assistant
-  sessions.
+```text
+src/            Rust CLI, app-server client, normalization, and local state
+tests/          Deterministic CLI integration tests
+smoke/          Opt-in live app-server checks
+skills/         Agent guidance for invoking codex-tamer
+scripts/        Installer, bundle packaging, and release utilities
+```
+
+## Provenance and License
+
+`codex-tamer` retains the MIT license of `codex-threads`. Released upstream
+history is preserved in [`CHANGELOG.md`](CHANGELOG.md); new hard-fork changes
+are recorded only under `Unreleased` until the first independent release.

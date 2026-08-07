@@ -2,7 +2,79 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Breaking Changes
+
+- Establish `codex-tamer` as an independent, headless hard fork of
+  `kcosr/codex-threads` `0.2.4`. Rename the binary, package, configuration and
+  state paths, environment variables, completion definitions, app-server client
+  identity, release artifacts, and packaged Skill from `codex-threads` to
+  `codex-tamer`.
+- Remove the interactive TUI, TUI-only actions, syntax-highlighting features,
+  screenshot asset, terminal dependencies, and PTY smoke tests. `codex-tamer`
+  is an Agent-facing CLI only.
+
+### Added
+
+- Add independent `wait`, `result`, and `events follow` commands so another
+  Agent process can reattach to a known thread/turn pair after a no-wait start.
+- Add validated raw history injection through Codex 0.146
+  `thread/inject_items`, accepting a JSON array from an argument, file, or
+  stdin without starting a user turn.
+- Add platform release bundles that package the prebuilt CLI and unchanged
+  Agent Skill together, plus a cross-platform installer, manifest validation,
+  SHA256 output, best-effort rollback that attempts both installed resources,
+  and deterministic packaging tests.
+- Add a five-platform tag workflow that validates binary identity, smoke-tests
+  each extracted archive, verifies adjacent checksums, and publishes a complete
+  GitHub Release with curated changelog notes and a combined `SHA256SUMS` file.
+
+### Changed
+
+- Reframe product documentation and the packaged Skill around independent Agent
+  control through JSON/NDJSON CLI commands.
+- Harden release automation with a validated configurable remote, a complete
+  locked preflight before tagging, Node.js 20 CI coverage, an enforced Linux
+  glibc/OpenSSL ABI baseline, and draft-only GitHub Release updates.
+- Declare the `codex-tamer` PATH dependency in the packaged Skill instead of
+  writing machine-specific binary paths into Skill instructions.
+- Preserve structured Codex turn errors in failed terminal events and aggregate
+  results when the server supplies them.
+- Cursor-page persisted turn lookup so `result` can find targets beyond the
+  app-server's per-request turn cap while respecting `--max-turns`.
+- Replay assistant content already persisted at attachment time before
+  `events follow` switches to live or polled events.
+- Bound pre-response notification buffers and release emitted NDJSON progress
+  records and assistant text instead of retaining the complete stream in memory.
+  Reconcile buffered replay in linear time and retain collision-resistant
+  BLAKE3 fingerprints after streamed text is released.
+- Index assistant item aliases and reject turns beyond 4,096 assistant items;
+  cap retained progress at 10,000 events or 16 MiB with explicit errors.
+
+### Fixed
+
+- Retry the fallback turn-history poll when Codex reports that a new thread is
+  not materialized yet, while continuing to surface unrelated `-32600` errors.
+- Keep fallback turn-history polling cancellable by command timeout and Ctrl-C,
+  and print server/thread/turn diagnostics for locally interrupted waits.
+- Reject persisted turns whose status is missing, non-string, or unknown instead
+  of treating malformed app-server responses as valid state.
+- Preserve the existing steer and interrupt acknowledgement shapes, validate
+  their app-server success responses, reject non-progressing result pages and
+  malformed cursor/inject/poll responses, and handle closed NDJSON output pipes
+  without panicking.
+- Apply attach timeouts and Ctrl-C handling to the initial resume request, use
+  terminal state already present in resume snapshots, retain notifications
+  received before an ignored materialization error, and suppress cross-ID
+  snapshot replay duplicates.
+- Reject installer flags supplied where a destination path is required, and
+  continue restoring the binary when restoring the Skill fails during rollback.
+- Reject colliding JSON-RPC server requests before matching client responses,
+  fail closed on malformed response envelopes and mutation acknowledgements,
+  and compile Windows as a WebSocket-only client.
+
+The released entries below are the preserved upstream `codex-threads` history.
+They are not `codex-tamer` releases, and their historical TUI references remain
+intentionally unchanged.
 
 ## [0.2.4] - 2026-07-30
 

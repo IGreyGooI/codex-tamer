@@ -1,5 +1,6 @@
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -14,33 +15,32 @@ use crate::cli::*;
 use crate::completion::{
     completion_candidates, completion_instructions, completion_script, normalize_shell,
 };
-#[cfg(feature = "tui")]
-use crate::config::resolve_tui_targets;
 use crate::config::{
     AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
     resolve_config_path, resolve_direct_target, resolve_target,
 };
-use crate::errors::{ExitError, usage_error};
+use crate::errors::{ExitError, app_server_error, usage_error};
 use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
 use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
     ShowThreadRequest, ThreadForkOptions, ThreadProjection, ThreadStartOptions,
     ThreadStatusRequest, fork_thread, is_thread_not_found_error, list_threads, load_messages,
-    loaded_status, read_thread_detail, request_with_direct_input_retry, request_with_resume_retry,
-    resume_thread_for_inspection, search_threads, start_thread, thread_id_from_fork,
-    thread_id_from_start, thread_status,
+    loaded_status, read_thread_detail, request_with_resume_retry, resume_thread_for_inspection,
+    search_threads, start_thread, thread_id_from_fork, thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::turns::{
-    TurnStartOptions, TurnTerminal, TurnWaitOutcome, start_turn as start_turn_request,
-    wait_for_turn,
+    AttachTurnOptions, TurnStartOptions, TurnTerminal, TurnWaitOutcome, attach_turn,
+    interrupt_turn as interrupt_turn_request, read_turn_result, start_turn as start_turn_request,
+    steer_turn as steer_turn_request, wait_for_turn,
 };
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SHOW_LAST: u32 = 20;
 const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
+const MAX_INJECT_JSON_BYTES: usize = 16 * 1024 * 1024;
 const THREAD_LABEL_WIDTH: usize = 56;
 const SEARCH_SNIPPET_WIDTH: usize = 48;
 const ANNOTATION_WIDTH: usize = 40;
@@ -149,17 +149,6 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await
         }
-        #[cfg(feature = "tui")]
-        Command::Tui(command) => {
-            let targets = resolve_tui_targets_for_command(
-                &config,
-                cli.connect.as_deref(),
-                cli.connect_auth_token_env.as_deref(),
-                cli.connect_auth_token.as_deref(),
-                command.server.server.clone(),
-            )?;
-            crate::tui::run_tui(targets, command, yolo).await
-        }
         Command::Messages(command) => {
             with_client(
                 &config,
@@ -201,6 +190,54 @@ async fn run(cli: Cli) -> Result<i32> {
                 cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { send_command(target, client, command, yolo).await },
+            )
+            .await
+        }
+        Command::Wait(command) => {
+            with_client(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { wait_command(target, client, command, yolo).await },
+            )
+            .await
+        }
+        Command::Result(command) => {
+            with_client(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { result_command(target, client, command).await },
+            )
+            .await
+        }
+        Command::Events(command) => match command.command {
+            EventsSubcommand::Follow(command) => {
+                with_client(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                    |target, client| async move {
+                        events_follow_command(target, client, command, yolo).await
+                    },
+                )
+                .await
+            }
+        },
+        Command::Inject(command) => {
+            with_client(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { inject_command(target, client, command, yolo).await },
             )
             .await
         }
@@ -462,9 +499,9 @@ fn resolve_target_for_command(
     server: Option<String>,
 ) -> Result<Target> {
     if let Some(endpoint) = connect {
-        if server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok() {
+        if server.is_some() || std::env::var("CODEX_TAMER_SERVER").is_ok() {
             return Err(usage_error(
-                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
+                "--connect is mutually exclusive with --server and CODEX_TAMER_SERVER",
             ));
         }
         return resolve_direct_target(endpoint, connect_auth_token_env, connect_auth_token);
@@ -476,35 +513,6 @@ fn resolve_target_for_command(
         ));
     }
     resolve_target(config, server.as_deref())
-}
-
-#[cfg(feature = "tui")]
-fn resolve_tui_targets_for_command(
-    config: &AppConfig,
-    connect: Option<&str>,
-    connect_auth_token_env: Option<&str>,
-    connect_auth_token: Option<&str>,
-    server: Option<String>,
-) -> Result<Vec<Target>> {
-    if let Some(endpoint) = connect {
-        if server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok() {
-            return Err(usage_error(
-                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
-            ));
-        }
-        return Ok(vec![resolve_direct_target(
-            endpoint,
-            connect_auth_token_env,
-            connect_auth_token,
-        )?]);
-    }
-
-    if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
-        return Err(usage_error(
-            "--connect-auth-token and --connect-auth-token-env require --connect",
-        ));
-    }
-    resolve_tui_targets(config, server.as_deref())
 }
 
 async fn with_client<F, Fut>(
@@ -583,10 +591,10 @@ async fn servers_command(
                 ));
             }
             if connect.is_some()
-                && (ping.server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok())
+                && (ping.server.is_some() || std::env::var("CODEX_TAMER_SERVER").is_ok())
             {
                 return Err(usage_error(
-                    "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
+                    "--connect is mutually exclusive with --server and CODEX_TAMER_SERVER",
                 ));
             }
             if ping.all {
@@ -797,13 +805,7 @@ async fn new_command(
     .await?;
     let thread_id = thread_id_from_start(&start)?;
     if let Some(name) = &command.name {
-        client
-            .request(
-                "thread/name/set",
-                json!({"threadId": thread_id, "name": name}),
-                |_| {},
-            )
-            .await?;
+        set_thread_name(&mut client, &thread_id, name).await?;
     }
     if let Some(prompt) = command.prompt {
         let turn = TurnOptions {
@@ -854,13 +856,7 @@ async fn fork_command(
     .await?;
     let thread_id = thread_id_from_fork(&fork)?;
     if let Some(name) = &command.name {
-        client
-            .request(
-                "thread/name/set",
-                json!({"threadId": thread_id, "name": name}),
-                |_| {},
-            )
-            .await?;
+        set_thread_name(&mut client, &thread_id, name).await?;
     }
     let output = json!({
         "server": target.server,
@@ -949,7 +945,7 @@ async fn start_turn(
     )
     .await?;
     if json_out && stream {
-        println!("{}", serde_json::to_string(&started.acceptance)?);
+        write_json_line(&started.acceptance)?;
     } else if json_out && no_wait {
         print_json(&started.acceptance)?;
     } else if !json_out {
@@ -970,9 +966,10 @@ async fn start_turn(
         started,
         TURN_SCAN_LIMIT,
         Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+        !(json_out && stream),
         |event| {
             if json_out && stream {
-                println!("{}", serde_json::to_string(event)?);
+                write_json_line(event)?;
             } else if !json_out {
                 print_human_event(event);
             }
@@ -984,19 +981,25 @@ async fn start_turn(
         TurnWaitOutcome::Terminal(terminal) => {
             emit_turn_terminal_output(json_out, stream, &terminal, target.server.as_str())
         }
-        TurnWaitOutcome::LocalInterrupt { thread_id, turn_id } => {
-            eprintln!("interrupted locally; turn is still running");
-            eprint!(
-                "{}",
-                key_values_text(&[
-                    ("server", target.server.as_str()),
-                    ("threadId", thread_id.as_str()),
-                    ("turnId", turn_id.as_str()),
-                ])
-            );
-            Ok(130)
-        }
+        TurnWaitOutcome::LocalInterrupt { thread_id, turn_id } => Ok(emit_local_interrupt(
+            target.server.as_str(),
+            thread_id.as_str(),
+            turn_id.as_str(),
+        )),
     }
+}
+
+fn emit_local_interrupt(server: &str, thread_id: &str, turn_id: &str) -> i32 {
+    eprintln!("interrupted locally; turn is still running");
+    eprint!(
+        "{}",
+        key_values_text(&[
+            ("server", server),
+            ("threadId", thread_id),
+            ("turnId", turn_id),
+        ])
+    );
+    130
 }
 
 fn emit_turn_terminal_output(
@@ -1027,6 +1030,223 @@ fn emit_turn_terminal_output(
         ]);
     }
     Ok(terminal.exit_code)
+}
+
+async fn wait_command(
+    target: Target,
+    mut client: RpcClient,
+    command: WaitCommand,
+    yolo: bool,
+) -> Result<i32> {
+    if command.timeout == 0 {
+        return Err(usage_error("--timeout must be greater than zero"));
+    }
+    let outcome = attach_turn(
+        &target,
+        &mut client,
+        AttachTurnOptions {
+            thread_id: command.thread_id,
+            turn_id: command.turn_id,
+            yolo,
+            poll_limit: TURN_SCAN_LIMIT,
+            timeout: Duration::from_secs(command.timeout),
+            retain_progress: true,
+        },
+        |_| Ok(()),
+    )
+    .await?;
+    let terminal = match outcome {
+        TurnWaitOutcome::Terminal(terminal) => terminal,
+        TurnWaitOutcome::LocalInterrupt { thread_id, turn_id } => {
+            return Ok(emit_local_interrupt(
+                target.server.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+            ));
+        }
+    };
+    if command.json {
+        print_json(&terminal.output)?;
+    } else {
+        print_key_values(&[
+            ("server", target.server.as_str()),
+            (
+                "threadId",
+                terminal.output["threadId"].as_str().unwrap_or(""),
+            ),
+            ("turnId", terminal.output["turnId"].as_str().unwrap_or("")),
+            ("status", terminal.output["status"].as_str().unwrap_or("")),
+            (
+                "finalAssistantText",
+                terminal.output["finalAssistantText"].as_str().unwrap_or(""),
+            ),
+        ]);
+    }
+    Ok(terminal.exit_code)
+}
+
+async fn result_command(
+    target: Target,
+    mut client: RpcClient,
+    command: ResultCommand,
+) -> Result<i32> {
+    if command.max_turns == 0 {
+        return Err(usage_error("--max-turns must be greater than zero"));
+    }
+    let output = read_turn_result(
+        &target,
+        &mut client,
+        &command.thread_id,
+        &command.turn_id,
+        command.max_turns,
+    )
+    .await?;
+    if command.json {
+        print_json(&output)?;
+    } else {
+        print_key_values(&[
+            ("server", target.server.as_str()),
+            ("threadId", output["threadId"].as_str().unwrap_or("")),
+            ("turnId", output["turnId"].as_str().unwrap_or("")),
+            ("status", output["status"].as_str().unwrap_or("")),
+            (
+                "finalAssistantText",
+                output["finalAssistantText"].as_str().unwrap_or(""),
+            ),
+        ]);
+    }
+    Ok(match output["status"].as_str() {
+        Some("failed" | "interrupted") => 1,
+        _ => 0,
+    })
+}
+
+async fn events_follow_command(
+    target: Target,
+    mut client: RpcClient,
+    command: EventsFollowCommand,
+    yolo: bool,
+) -> Result<i32> {
+    if command.timeout == 0 {
+        return Err(usage_error("--timeout must be greater than zero"));
+    }
+    let outcome = attach_turn(
+        &target,
+        &mut client,
+        AttachTurnOptions {
+            thread_id: command.thread_id,
+            turn_id: command.turn_id,
+            yolo,
+            poll_limit: TURN_SCAN_LIMIT,
+            timeout: Duration::from_secs(command.timeout),
+            retain_progress: false,
+        },
+        write_json_line,
+    )
+    .await?;
+    match outcome {
+        TurnWaitOutcome::Terminal(terminal) => Ok(terminal.exit_code),
+        TurnWaitOutcome::LocalInterrupt { thread_id, turn_id } => Ok(emit_local_interrupt(
+            target.server.as_str(),
+            thread_id.as_str(),
+            turn_id.as_str(),
+        )),
+    }
+}
+
+async fn inject_command(
+    target: Target,
+    mut client: RpcClient,
+    command: InjectCommand,
+    yolo: bool,
+) -> Result<i32> {
+    let items = load_injected_items(command.items_json.as_deref(), command.items_file.as_deref())?;
+    let item_count = items
+        .as_array()
+        .map(Vec::len)
+        .expect("validated injected items");
+    let thread_id = command.thread_id.clone();
+    let result = request_with_resume_retry(
+        &mut client,
+        "thread/inject_items",
+        json!({"threadId": thread_id, "items": items}),
+        &command.thread_id,
+        yolo,
+        || {},
+        |_| {},
+    )
+    .await?;
+    if !result.is_object() {
+        return Err(app_server_error(
+            "thread/inject_items response must be an object",
+        ));
+    }
+    let output = json!({
+        "server": target.server,
+        "threadId": command.thread_id,
+        "status": "accepted",
+        "itemCount": item_count
+    });
+    emit_json_or_status(command.json, &output)
+}
+
+fn load_injected_items(
+    items_json: Option<&str>,
+    items_file: Option<&std::path::Path>,
+) -> Result<Value> {
+    let raw = if let Some(raw) = items_json {
+        reject_oversized_injected_items(raw)?;
+        raw.to_string()
+    } else if let Some(path) = items_file {
+        if path.as_os_str() == "-" {
+            read_injected_items(io::stdin(), "stdin")?
+        } else {
+            let file = fs::File::open(path).map_err(|err| {
+                usage_error(format!(
+                    "failed to read injected items from `{}`: {err}",
+                    path.display()
+                ))
+            })?;
+            read_injected_items(file, &format!("`{}`", path.display()))?
+        }
+    } else {
+        return Err(usage_error("provide --items-json or --items-file"));
+    };
+    let items: Value = serde_json::from_str(&raw)
+        .map_err(|err| usage_error(format!("injected items are not valid JSON: {err}")))?;
+    let Some(items_array) = items.as_array() else {
+        return Err(usage_error("injected items must be a non-empty JSON array"));
+    };
+    if items_array.is_empty() {
+        return Err(usage_error("injected items must be a non-empty JSON array"));
+    }
+    if items_array.iter().any(|item| !item.is_object()) {
+        return Err(usage_error("every injected item must be a JSON object"));
+    }
+    Ok(items)
+}
+
+fn read_injected_items(reader: impl Read, source: &str) -> Result<String> {
+    let mut raw = String::new();
+    reader
+        .take((MAX_INJECT_JSON_BYTES + 1) as u64)
+        .read_to_string(&mut raw)
+        .map_err(|err| {
+            usage_error(format!(
+                "failed to read injected items from {source}: {err}"
+            ))
+        })?;
+    reject_oversized_injected_items(&raw)?;
+    Ok(raw)
+}
+
+fn reject_oversized_injected_items(raw: &str) -> Result<()> {
+    if raw.len() > MAX_INJECT_JSON_BYTES {
+        return Err(usage_error(format!(
+            "injected items exceed the {MAX_INJECT_JSON_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
 }
 
 fn print_legacy_warnings(config: &AppConfig) {
@@ -1090,7 +1310,7 @@ async fn settings_set_command(
         params.insert("serviceTier".to_string(), json!(tier));
     }
     let thread_id = command.thread_id.clone();
-    let _ = request_with_resume_retry(
+    let result = request_with_resume_retry(
         &mut client,
         "thread/settings/update",
         Value::Object(params),
@@ -1100,6 +1320,7 @@ async fn settings_set_command(
         |_| {},
     )
     .await?;
+    validate_object_response("thread/settings/update", &result)?;
     let output = json!({"server": target.server, "threadId": command.thread_id, "status": "accepted", "requested": {"model": command.model, "effort": command.effort, "serviceTier": command.service_tier, "clearServiceTier": command.clear_service_tier}});
     emit_json_or_status(command.json, &output)
 }
@@ -1173,18 +1394,15 @@ async fn steer_command(
     command: SteerCommand,
     yolo: bool,
 ) -> Result<i32> {
-    let params = json!({"threadId": command.thread_id, "expectedTurnId": command.turn_id, "input": [{"type": "text", "text": command.prompt, "textElements": []}]});
-    let result = request_with_direct_input_retry(
+    let output = steer_turn_request(
+        &target,
         &mut client,
-        "turn/steer",
-        params,
-        &command.thread_id,
+        command.thread_id,
+        command.turn_id,
+        command.prompt,
         yolo,
-        || {},
-        |_| {},
     )
     .await?;
-    let output = json!({"server": target.server, "threadId": command.thread_id, "turnId": result["turnId"].as_str().unwrap_or(&command.turn_id), "status": "accepted"});
     emit_json_or_status(command.json, &output)
 }
 
@@ -1193,27 +1411,27 @@ async fn interrupt_command(
     mut client: RpcClient,
     command: InterruptCommand,
 ) -> Result<i32> {
-    let _ = client
-        .request(
-            "turn/interrupt",
-            json!({"threadId": command.thread_id, "turnId": command.turn_id}),
-            |_| {},
-        )
-        .await?;
-    let output = json!({"server": target.server, "threadId": command.thread_id, "turnId": command.turn_id, "status": "accepted"});
+    let output =
+        interrupt_turn_request(&target, &mut client, command.thread_id, command.turn_id).await?;
     emit_json_or_status(command.json, &output)
 }
 
 async fn name_command(target: Target, mut client: RpcClient, command: NameCommand) -> Result<i32> {
-    let _ = client
+    set_thread_name(&mut client, &command.thread_id, &command.name).await?;
+    let output = json!({"server": target.server, "threadId": command.thread_id, "name": command.name, "status": "accepted"});
+    emit_json_or_status(command.json, &output)
+}
+
+async fn set_thread_name(client: &mut RpcClient, thread_id: &str, name: &str) -> Result<()> {
+    let result = client
         .request(
             "thread/name/set",
-            json!({"threadId": command.thread_id, "name": command.name}),
+            json!({"threadId": thread_id, "name": name}),
             |_| {},
         )
         .await?;
-    let output = json!({"server": target.server, "threadId": command.thread_id, "name": command.name, "status": "accepted"});
-    emit_json_or_status(command.json, &output)
+    validate_object_response("thread/name/set", &result)?;
+    Ok(())
 }
 
 async fn archive_command(
@@ -1230,12 +1448,18 @@ async fn archive_command(
     let result = client
         .request(method, json!({"threadId": command.thread_id}), |_| {})
         .await?;
+    let thread = if archive {
+        validate_object_response(method, &result)?;
+        Value::Null
+    } else {
+        validate_thread_response(method, &result, &command.thread_id)?.clone()
+    };
     let output = json!({
         "server": target.server,
         "threadId": command.thread_id,
         "archived": archive,
         "status": "accepted",
-        "thread": result.get("thread").cloned().unwrap_or(Value::Null)
+        "thread": thread
     });
     emit_json_or_status(command.json, &output)
 }
@@ -1253,12 +1477,24 @@ async fn pin_command(
             |_| {},
         )
         .await?;
+    let thread = validate_thread_response("thread/metadata/update", &result, &command.thread_id)?;
+    let actual_pinned = thread
+        .get("isPinned")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            app_server_error("thread/metadata/update response thread.isPinned must be a boolean")
+        })?;
+    if actual_pinned != pinned {
+        return Err(app_server_error(format!(
+            "thread/metadata/update response thread.isPinned does not match {pinned}"
+        )));
+    }
     let output = json!({
         "server": target.server,
         "threadId": command.thread_id,
         "pinned": pinned,
         "status": "accepted",
-        "thread": result.get("thread").cloned().unwrap_or(Value::Null)
+        "thread": thread
     });
     emit_json_or_status(command.json, &output)
 }
@@ -1486,6 +1722,7 @@ async fn usage_redeem_command(
             |_| {},
         )
         .await?;
+    let outcome = validate_rate_limit_reset_outcome(&outcome)?.to_string();
     let (refreshed, refresh_error) = match client
         .request("account/rateLimits/read", json!({}), |_| {})
         .await
@@ -1495,7 +1732,7 @@ async fn usage_redeem_command(
     };
     let output = json!({
         "server": target.server,
-        "outcome": outcome["outcome"],
+        "outcome": outcome,
         "credit": {
             "id": credit.id,
             "title": credit.title,
@@ -1544,7 +1781,7 @@ fn create_rate_limit_reset_idempotency_key() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    format!("codex-threads-{millis}-{}", std::process::id())
+    format!("codex-tamer-{millis}-{}", std::process::id())
 }
 
 async fn goal_get_command(
@@ -1590,9 +1827,10 @@ async fn goal_set_command(
         params.insert("tokenBudget".to_string(), json!(budget));
     }
     let result = client
-        .request("thread/goal/set", Value::Object(params), |_| {})
+        .request("thread/goal/set", Value::Object(params.clone()), |_| {})
         .await?;
-    let output = json!({"server": target.server, "threadId": command.thread_id, "goal": result["goal"], "status": "accepted"});
+    let goal = validate_goal_set_response(&result, &command.thread_id, &params)?;
+    let output = json!({"server": target.server, "threadId": command.thread_id, "goal": goal, "status": "accepted"});
     emit_json_or_status(command.json, &output)
 }
 
@@ -1608,8 +1846,134 @@ async fn goal_clear_command(
             |_| {},
         )
         .await?;
-    let output = json!({"server": target.server, "threadId": command.thread_id, "cleared": result["cleared"], "status": "accepted"});
+    let cleared = validate_boolean_response_field("thread/goal/clear", &result, "cleared")?;
+    let output = json!({"server": target.server, "threadId": command.thread_id, "cleared": cleared, "status": "accepted"});
     emit_json_or_status(command.json, &output)
+}
+
+fn validate_object_response<'a>(method: &str, result: &'a Value) -> Result<&'a Map<String, Value>> {
+    result
+        .as_object()
+        .ok_or_else(|| app_server_error(format!("{method} response must be an object")))
+}
+
+fn validate_thread_response<'a>(
+    method: &str,
+    result: &'a Value,
+    expected_thread_id: &str,
+) -> Result<&'a Value> {
+    let response = validate_object_response(method, result)?;
+    let thread = response
+        .get("thread")
+        .filter(|thread| thread.is_object())
+        .ok_or_else(|| app_server_error(format!("{method} response missing thread object")))?;
+    let thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| app_server_error(format!("{method} response thread.id must be a string")))?;
+    if thread_id != expected_thread_id {
+        return Err(app_server_error(format!(
+            "{method} response thread.id `{thread_id}` does not match `{expected_thread_id}`"
+        )));
+    }
+    Ok(thread)
+}
+
+fn validate_goal_set_response<'a>(
+    result: &'a Value,
+    expected_thread_id: &str,
+    requested: &Map<String, Value>,
+) -> Result<&'a Value> {
+    const METHOD: &str = "thread/goal/set";
+    let response = validate_object_response(METHOD, result)?;
+    let goal = response
+        .get("goal")
+        .filter(|goal| goal.is_object())
+        .ok_or_else(|| app_server_error(format!("{METHOD} response missing goal object")))?;
+    let thread_id = goal
+        .get("threadId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            app_server_error(format!("{METHOD} response goal.threadId must be a string"))
+        })?;
+    if thread_id != expected_thread_id {
+        return Err(app_server_error(format!(
+            "{METHOD} response goal.threadId `{thread_id}` does not match `{expected_thread_id}`"
+        )));
+    }
+    validate_goal_fields(goal)?;
+    for field in ["objective", "status", "tokenBudget"] {
+        if let Some(expected) = requested.get(field)
+            && goal.get(field) != Some(expected)
+        {
+            return Err(app_server_error(format!(
+                "{METHOD} response goal.{field} does not match the requested value"
+            )));
+        }
+    }
+    Ok(goal)
+}
+
+fn validate_goal_fields(goal: &Value) -> Result<()> {
+    const METHOD: &str = "thread/goal/set";
+    if !goal.get("objective").is_some_and(Value::is_string) {
+        return Err(app_server_error(format!(
+            "{METHOD} response goal.objective must be a string"
+        )));
+    }
+    let status = goal.get("status").and_then(Value::as_str).ok_or_else(|| {
+        app_server_error(format!("{METHOD} response goal.status must be a string"))
+    })?;
+    if !matches!(
+        status,
+        "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete"
+    ) {
+        return Err(app_server_error(format!(
+            "{METHOD} response has unknown goal.status `{status}`"
+        )));
+    }
+    if !goal
+        .get("tokenBudget")
+        .is_some_and(|value| value.is_null() || value.as_i64().is_some())
+    {
+        return Err(app_server_error(format!(
+            "{METHOD} response goal.tokenBudget must be an integer or null"
+        )));
+    }
+    for field in ["tokensUsed", "timeUsedSeconds", "createdAt", "updatedAt"] {
+        if goal.get(field).is_none_or(|value| value.as_i64().is_none()) {
+            return Err(app_server_error(format!(
+                "{METHOD} response goal.{field} must be an integer"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_boolean_response_field(method: &str, result: &Value, field: &str) -> Result<bool> {
+    let response = validate_object_response(method, result)?;
+    response
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| app_server_error(format!("{method} response {field} must be a boolean")))
+}
+
+fn validate_rate_limit_reset_outcome(result: &Value) -> Result<&str> {
+    const METHOD: &str = "account/rateLimitResetCredit/consume";
+    let response = validate_object_response(METHOD, result)?;
+    let outcome = response
+        .get("outcome")
+        .and_then(Value::as_str)
+        .ok_or_else(|| app_server_error(format!("{METHOD} response outcome must be a string")))?;
+    if !matches!(
+        outcome,
+        "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed"
+    ) {
+        return Err(app_server_error(format!(
+            "{METHOD} response has unknown outcome `{outcome}`"
+        )));
+    }
+    Ok(outcome)
 }
 
 fn print_human_event(event: &Value) {
@@ -2138,6 +2502,19 @@ fn print_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn write_json_line(value: &Value) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_json_line_to(&mut stdout, value)
+}
+
+fn write_json_line_to(writer: &mut impl Write, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         map.insert(key.to_string(), json!(value));
@@ -2195,98 +2572,24 @@ fn classify_error(err: &anyhow::Error) -> i32 {
     }
 }
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use super::*;
 
-    use crate::config::{AppConfig, ServerConfig};
+    struct BrokenPipeWriter;
 
-    use super::resolve_tui_targets_for_command;
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed pipe"))
+        }
 
-    fn test_config() -> AppConfig {
-        let mut servers = BTreeMap::new();
-        servers.insert(
-            "main".to_string(),
-            ServerConfig {
-                endpoint: Some("unix:///tmp/codex-main.sock".to_string()),
-                kind: None,
-                path: None,
-                auth_token_env: None,
-                auth_token: None,
-                model: None,
-                model_reasoning_effort: None,
-                allow_rate_limit_reset: false,
-            },
-        );
-        servers.insert(
-            "work".to_string(),
-            ServerConfig {
-                endpoint: Some("unix:///tmp/codex-work.sock".to_string()),
-                kind: None,
-                path: None,
-                auth_token_env: None,
-                auth_token: None,
-                model: None,
-                model_reasoning_effort: None,
-                allow_rate_limit_reset: false,
-            },
-        );
-        AppConfig {
-            model: None,
-            model_reasoning_effort: None,
-            servers,
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
     #[test]
-    fn tui_targets_default_to_all_configured_servers() {
-        let targets =
-            resolve_tui_targets_for_command(&test_config(), None, None, None, None).unwrap();
-
-        assert_eq!(
-            targets
-                .iter()
-                .map(|target| target.server.as_str())
-                .collect::<Vec<_>>(),
-            vec!["main", "work"]
-        );
-    }
-
-    #[test]
-    fn tui_targets_honor_server_override() {
-        let targets = resolve_tui_targets_for_command(
-            &test_config(),
-            None,
-            None,
-            None,
-            Some("work".to_string()),
-        )
-        .unwrap();
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].server, "work");
-    }
-
-    #[test]
-    fn tui_connect_is_mutually_exclusive_with_server_override() {
-        let error = resolve_tui_targets_for_command(
-            &test_config(),
-            Some("unix:///tmp/direct.sock"),
-            None,
-            None,
-            Some("main".to_string()),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("mutually exclusive"));
-    }
-
-    #[test]
-    fn tui_connect_auth_requires_connect() {
-        let error =
-            resolve_tui_targets_for_command(&test_config(), None, Some("TOKEN_ENV"), None, None)
-                .unwrap_err();
-
-        assert!(error.to_string().contains("require --connect"));
+    fn ndjson_writer_returns_broken_pipe_instead_of_panicking() {
+        assert!(write_json_line_to(&mut BrokenPipeWriter, &json!({"type": "accepted"})).is_err());
     }
 }

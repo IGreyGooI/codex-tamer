@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${BIN:-$ROOT/target/debug/codex-threads}"
+BIN="${BIN:-$ROOT/target/debug/codex-tamer}"
 CODEX_ENDPOINT="${CODEX_ENDPOINT:-${CODEX_SOCK:-unix:///var/run/user/1000/codex.sock}}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_EFFORT="${CODEX_EFFORT:-high}"
@@ -87,7 +87,7 @@ assert_goal_null() {
 }
 
 assert_goal_set() {
-	node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const value = JSON.parse(s); const goal = value.goal; if (!goal || goal.objective !== "codex-threads live smoke goal" || goal.status !== "active" || goal.tokenBudget !== 1234) { console.error(`unexpected goal response: ${JSON.stringify(value)}`); process.exit(1); } });'
+	node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const value = JSON.parse(s); const goal = value.goal; if (!goal || goal.objective !== "codex-tamer live smoke goal" || goal.status !== "active" || goal.tokenBudget !== 1234) { console.error(`unexpected goal response: ${JSON.stringify(value)}`); process.exit(1); } });'
 }
 
 assert_goal_cleared() {
@@ -101,7 +101,7 @@ assert_settings() {
 run "$BIN" --config "$CONFIG" servers ping --server live --json
 run "$BIN" --config "$CONFIG" models --server live --json
 
-THREAD_JSON="$(run "$BIN" --config "$CONFIG" new --server live --cwd "$WORKDIR" --name "codex-threads live smoke" --json)"
+THREAD_JSON="$(run "$BIN" --config "$CONFIG" new --server live --cwd "$WORKDIR" --name "codex-tamer live smoke" --json)"
 echo "$THREAD_JSON"
 THREAD_ID="$(printf '%s\n' "$THREAD_JSON" | extract_thread_id)"
 
@@ -109,13 +109,13 @@ run "$BIN" --config "$CONFIG" status --server live --json "$THREAD_ID"
 SETTINGS_JSON="$(run "$BIN" --config "$CONFIG" settings show --server live --json "$THREAD_ID")"
 echo "$SETTINGS_JSON"
 printf '%s\n' "$SETTINGS_JSON" | assert_settings "$CODEX_MODEL" "$CODEX_EFFORT"
-run "$BIN" --config "$CONFIG" name --server live --json "$THREAD_ID" "codex-threads live smoke"
+run "$BIN" --config "$CONFIG" name --server live --json "$THREAD_ID" "codex-tamer live smoke"
 
 GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal get --server live --json "$THREAD_ID")"
 echo "$GOAL_JSON"
 printf '%s\n' "$GOAL_JSON" | assert_goal_null
 
-GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal set --server live --json "$THREAD_ID" --objective "codex-threads live smoke goal" --status active --token-budget 1234)"
+GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal set --server live --json "$THREAD_ID" --objective "codex-tamer live smoke goal" --status active --token-budget 1234)"
 echo "$GOAL_JSON"
 printf '%s\n' "$GOAL_JSON" | assert_goal_set
 
@@ -140,7 +140,7 @@ if [[ "${RUN_CODEX_TURN:-0}" == "1" ]]; then
 		--effort "$CODEX_EFFORT" \
 		--json \
 		"$THREAD_ID" \
-		"Reply with exactly: codex-threads smoke ok"
+		"Reply with exactly: codex-tamer smoke ok"
 fi
 
 if [[ "${RUN_ARCHIVE:-0}" == "1" ]]; then

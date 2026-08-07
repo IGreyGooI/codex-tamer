@@ -62,7 +62,7 @@ impl Default for AnnotationState {
 
 pub fn state_path() -> PathBuf {
     resolve_state_path_from(
-        env::var("CODEX_THREADS_STATE").ok().as_deref(),
+        env::var("CODEX_TAMER_STATE").ok().as_deref(),
         env::var("XDG_STATE_HOME").ok().as_deref(),
         &home_dir(),
     )
@@ -76,9 +76,9 @@ pub fn resolve_state_path_from(
     let dir = if let Some(path) = state_dir_env {
         PathBuf::from(path)
     } else if let Some(path) = xdg_state_home {
-        PathBuf::from(path).join("codex-threads")
+        PathBuf::from(path).join("codex-tamer")
     } else {
-        home.join(".local/state/codex-threads")
+        home.join(".local/state/codex-tamer")
     };
     dir.join(STATE_FILE)
 }
@@ -360,12 +360,12 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         // SAFETY: These tests run synchronously and only depend on this process env.
         unsafe {
-            env::set_var("CODEX_THREADS_STATE", temp.path());
+            env::set_var("CODEX_TAMER_STATE", temp.path());
             env::remove_var("XDG_STATE_HOME");
         }
         let result = f(&temp);
         unsafe {
-            env::remove_var("CODEX_THREADS_STATE");
+            env::remove_var("CODEX_TAMER_STATE");
         }
         result
     }
@@ -379,11 +379,11 @@ mod tests {
         );
         assert_eq!(
             resolve_state_path_from(None, Some("/tmp/xdg"), &home),
-            PathBuf::from("/tmp/xdg/codex-threads/annotations.json")
+            PathBuf::from("/tmp/xdg/codex-tamer/annotations.json")
         );
         assert_eq!(
             resolve_state_path_from(None, None, &home),
-            PathBuf::from("/home/tester/.local/state/codex-threads/annotations.json")
+            PathBuf::from("/home/tester/.local/state/codex-tamer/annotations.json")
         );
     }
 

@@ -5,18 +5,20 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(unix)]
+use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_with_config, connect_async_with_config,
-};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 use crate::config::Endpoint;
 
+#[cfg(unix)]
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,7 +59,19 @@ pub struct RpcClient {
 impl RpcClient {
     pub async fn connect(endpoint: &Endpoint) -> Result<Self> {
         let stream = match endpoint {
-            Endpoint::Unix { path } => RpcStream::Unix(connect_unix(path).await?),
+            Endpoint::Unix { path } => {
+                #[cfg(unix)]
+                {
+                    RpcStream::Unix(connect_unix(path).await?)
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(anyhow!(
+                        "unix socket endpoint `{}` is unsupported on this platform; use ws:// or wss://",
+                        path.display()
+                    ));
+                }
+            }
             Endpoint::WebSocket { url, auth_token } => {
                 RpcStream::Tcp(connect_websocket(url, auth_token.as_deref()).await?)
             }
@@ -117,6 +131,7 @@ impl RpcClient {
 }
 
 enum RpcStream {
+    #[cfg(unix)]
     Unix(WebSocketStream<UnixStream>),
     Tcp(WebSocketStream<MaybeTlsStream<TcpStream>>),
 }
@@ -127,6 +142,7 @@ impl RpcStream {
         message: Message,
     ) -> std::result::Result<(), tokio_tungstenite::tungstenite::Error> {
         match self {
+            #[cfg(unix)]
             RpcStream::Unix(stream) => stream.send(message).await,
             RpcStream::Tcp(stream) => stream.send(message).await,
         }
@@ -136,12 +152,14 @@ impl RpcStream {
         &mut self,
     ) -> Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> {
         match self {
+            #[cfg(unix)]
             RpcStream::Unix(stream) => stream.next().await,
             RpcStream::Tcp(stream) => stream.next().await,
         }
     }
 }
 
+#[cfg(unix)]
 async fn connect_unix(path: &std::path::Path) -> Result<WebSocketStream<UnixStream>> {
     let request = HANDSHAKE_URL
         .into_client_request()
@@ -202,8 +220,8 @@ impl RpcClient {
                 "initialize",
                 json!({
                     "clientInfo": {
-                        "name": "codex-threads",
-                        "title": "codex-threads",
+                        "name": "codex-tamer",
+                        "title": "codex-tamer",
                         "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
@@ -264,16 +282,6 @@ impl RpcClient {
             };
             let value: Value = serde_json::from_str(&text)
                 .with_context(|| format!("app-server sent invalid JSON: {text}"))?;
-            if value.get("id").and_then(Value::as_i64) == Some(id) {
-                if let Some(error) = value.get("error") {
-                    let error = parse_rpc_error(error);
-                    return Err(anyhow!(RpcRequestError {
-                        method: method.to_string(),
-                        error,
-                    }));
-                }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-            }
             if let Some(method) = value.get("method").and_then(Value::as_str) {
                 if value.get("id").is_some() {
                     self.reject_server_request(&value).await?;
@@ -282,6 +290,18 @@ impl RpcClient {
                         method: method.to_string(),
                         params: value.get("params").cloned().unwrap_or(Value::Null),
                     });
+                }
+                continue;
+            }
+            if let Some(response) = parse_response_for_id(&value, id)? {
+                match response {
+                    ParsedResponse::Success(result) => return Ok(result),
+                    ParsedResponse::Failure(error) => {
+                        return Err(anyhow!(RpcRequestError {
+                            method: method.to_string(),
+                            error,
+                        }));
+                    }
                 }
             }
         }
@@ -331,14 +351,34 @@ impl RpcClient {
     }
 }
 
-fn parse_rpc_error(error: &Value) -> RpcError {
-    RpcError {
-        code: error.get("code").and_then(Value::as_i64).unwrap_or(-32000),
-        message: error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown app-server error")
-            .to_string(),
+enum ParsedResponse {
+    Success(Value),
+    Failure(RpcError),
+}
+
+fn parse_response_for_id(value: &Value, id: i64) -> Result<Option<ParsedResponse>> {
+    if value.get("id").and_then(Value::as_i64) != Some(id) {
+        return Ok(None);
+    }
+    match (value.get("result"), value.get("error")) {
+        (Some(result), None) => Ok(Some(ParsedResponse::Success(result.clone()))),
+        (None, Some(error)) => {
+            let code = error
+                .get("code")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("app-server response error is missing integer `code`"))?;
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("app-server response error is missing string `message`"))?;
+            Ok(Some(ParsedResponse::Failure(RpcError {
+                code,
+                message: message.to_string(),
+            })))
+        }
+        _ => Err(anyhow!(
+            "app-server response for request id {id} must contain exactly one of `result` or `error`"
+        )),
     }
 }
 
@@ -350,5 +390,126 @@ pub fn format_rpc_error(method: &str, error: &RpcError) -> String {
             "app-server `{method}` error {}: {}",
             error.code, error.message
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    #[test]
+    fn response_parser_requires_exactly_one_payload() {
+        assert!(
+            parse_response_for_id(&json!({"id": 2, "result": null}), 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            parse_response_for_id(&json!({"id": 1, "result": {"ok": true}}), 1).unwrap(),
+            Some(ParsedResponse::Success(_))
+        ));
+        assert!(parse_response_for_id(&json!({"id": 1}), 1).is_err());
+        assert!(
+            parse_response_for_id(
+                &json!({"id": 1, "result": null, "error": {"code": -1, "message": "bad"}}),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn response_parser_validates_error_shape() {
+        assert!(parse_response_for_id(&json!({"id": 1, "error": {}}), 1).is_err());
+        let Some(ParsedResponse::Failure(error)) = parse_response_for_id(
+            &json!({"id": 1, "error": {"code": -32600, "message": "invalid"}}),
+            1,
+        )
+        .unwrap() else {
+            panic!("expected error response");
+        };
+        assert_eq!(error.code, -32600);
+        assert_eq!(error.message, "invalid");
+    }
+
+    #[tokio::test]
+    async fn server_request_with_matching_id_does_not_complete_client_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let initialize = websocket.next().await.unwrap().unwrap();
+            let Message::Text(initialize) = initialize else {
+                panic!("expected initialize request");
+            };
+            let initialize: Value = serde_json::from_str(&initialize).unwrap();
+            assert_eq!(initialize["method"], "initialize");
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let initialized = websocket.next().await.unwrap().unwrap();
+            let Message::Text(initialized) = initialized else {
+                panic!("expected initialized notification");
+            };
+            let initialized: Value = serde_json::from_str(&initialized).unwrap();
+            assert_eq!(initialized["method"], "initialized");
+
+            let request = websocket.next().await.unwrap().unwrap();
+            let Message::Text(request) = request else {
+                panic!("expected client request");
+            };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "thread/read");
+            let id = request["id"].clone();
+
+            websocket
+                .send(Message::Text(
+                    json!({"id": id, "method": "approval/request", "params": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let rejection = websocket.next().await.unwrap().unwrap();
+            let Message::Text(rejection) = rejection else {
+                panic!("expected text rejection");
+            };
+            let rejection: Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(rejection["id"], id);
+            assert_eq!(rejection["error"]["code"], -32601);
+
+            websocket
+                .send(Message::Text(
+                    json!({"id": id, "result": {"completed": true}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+        });
+
+        let endpoint = Endpoint::WebSocket {
+            url: format!("ws://{address}"),
+            auth_token: None,
+        };
+        let mut client = RpcClient::connect(&endpoint).await.unwrap();
+        let response = client
+            .request("thread/read", json!({"threadId": "thread_1"}), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(response, json!({"completed": true}));
+        drop(client);
+        server.await.unwrap();
     }
 }

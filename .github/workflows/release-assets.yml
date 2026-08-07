@@ -1,0 +1,181 @@
+name: Release Assets
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.bundle_target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            bundle_target: linux-x86_64
+            binary: target/x86_64-unknown-linux-gnu/release/codex-tamer
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            bundle_target: linux-aarch64
+            binary: target/aarch64-unknown-linux-gnu/release/codex-tamer
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            bundle_target: macos-aarch64
+            binary: target/aarch64-apple-darwin/release/codex-tamer
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            bundle_target: macos-x86_64
+            binary: target/x86_64-apple-darwin/release/codex-tamer
+          - runner: windows-2025
+            rust_target: x86_64-pc-windows-msvc
+            bundle_target: windows-x86_64
+            binary: target/x86_64-pc-windows-msvc/release/codex-tamer.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust_target }}
+          components: rustfmt, clippy
+      - name: Verify tag version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$version" = "$cargo_version"
+      - name: Run Node tests
+        shell: bash
+        run: node --test scripts/*.test.mjs
+      - name: Run Rust checks
+        shell: bash
+        run: |
+          cargo fmt --check
+          cargo test --locked --target "${{ matrix.rust_target }}"
+          cargo clippy --locked --target "${{ matrix.rust_target }}" --all-targets --all-features -- -D warnings
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.rust_target }}"
+      - name: Verify Linux ABI baseline
+        if: startsWith(matrix.bundle_target, 'linux-')
+        shell: bash
+        run: |
+          binary="${{ matrix.binary }}"
+          glibc_baseline="GLIBC_2.34"
+          max_glibc="$(readelf --version-info "$binary" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' | sort -V | tail -1)"
+          test -n "$max_glibc"
+          test "$(printf '%s\n%s\n' "${glibc_baseline#GLIBC_}" "$max_glibc" | sort -V | tail -1)" = "${glibc_baseline#GLIBC_}"
+          readelf --dynamic "$binary" | grep -Eq '\(NEEDED\).*libssl\.so\.3'
+          readelf --dynamic "$binary" | grep -Eq '\(NEEDED\).*libcrypto\.so\.3'
+      - name: Package release bundle
+        shell: bash
+        run: |
+          node scripts/package-release.mjs \
+            --binary "${{ matrix.binary }}" \
+            --target "${{ matrix.bundle_target }}" \
+            --out-dir dist > package-result.json
+      - name: Smoke install packaged binary and Skill
+        shell: bash
+        run: |
+          archive_path="$(node -e 'const fs=require("fs"); process.stdout.write(JSON.parse(fs.readFileSync("package-result.json", "utf8")).archivePath)')"
+          bundle_name="$(node -e 'const fs=require("fs"); process.stdout.write(JSON.parse(fs.readFileSync("package-result.json", "utf8")).bundleName)')"
+          extract_root="${RUNNER_TEMP}/codex-tamer-extracted"
+          install_root="${RUNNER_TEMP}/codex-tamer-install"
+          mkdir -p "$extract_root"
+          if [ "${{ matrix.bundle_target }}" = "windows-x86_64" ]; then
+            unzip -q "$archive_path" -d "$extract_root"
+          else
+            tar -xf "$archive_path" -C "$extract_root"
+          fi
+          bundle_path="${extract_root}/${bundle_name}"
+          test -f "${bundle_path}/manifest.json"
+          node "${bundle_path}/install.mjs" \
+            --bin-dir "${install_root}/bin" \
+            --skills-dir "${install_root}/skills" \
+            --json > install-result.json
+          binary_name="codex-tamer"
+          if [ "${{ matrix.bundle_target }}" = "windows-x86_64" ]; then binary_name="codex-tamer.exe"; fi
+          test "$("${install_root}/bin/${binary_name}" --version)" = "codex-tamer ${GITHUB_REF_NAME#v}"
+          node -e 'const fs=require("fs"); const path=require("path"); const root=process.argv[1]; const installed=process.argv[2]; if (!fs.readFileSync(path.join(root,"skills/codex-tamer/SKILL.md")).equals(fs.readFileSync(path.join(installed,"codex-tamer/SKILL.md")))) process.exit(1)' "$PWD" "${install_root}/skills"
+      - name: Upload verified bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.bundle_target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: Download platform bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify and assemble checksums
+        shell: bash
+        run: node scripts/assemble-release-assets.mjs --dir release-assets --version "${GITHUB_REF_NAME#v}"
+      - name: Create draft, upload assets, and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          release_notes="${RUNNER_TEMP}/codex-tamer-release-notes.md"
+          node --input-type=module - "$version" "$release_notes" <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { releaseNotesFromChangelog } from "./scripts/release.mjs";
+
+          const [version, notesPath] = process.argv.slice(2);
+          const notes = releaseNotesFromChangelog(readFileSync("CHANGELOG.md", "utf8"), version);
+          writeFileSync(notesPath, `${notes}\n`);
+          NODE
+
+          existing_is_draft=""
+          if existing_is_draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$existing_is_draft" != "true" ]; then
+              echo "Refusing to modify published GitHub Release $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file "$release_notes"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --verify-tag --notes-file "$release_notes" --draft
+          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            release-assets/*.tar.gz \
+            release-assets/*.zip \
+            release-assets/*.sha256 \
+            release-assets/SHA256SUMS
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

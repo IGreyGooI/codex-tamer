@@ -7,7 +7,7 @@ use crate::config::parse_reasoning_effort;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "codex-threads",
+    name = "codex-tamer",
     version,
     about = "Query and control Codex app-server threads"
 )]
@@ -46,8 +46,6 @@ pub enum Command {
     List(ListCommand),
     Search(SearchCommand),
     Show(ShowCommand),
-    #[cfg(feature = "tui")]
-    Tui(TuiCommand),
     #[command(
         about = "Show flattened messages from a bounded recent turn scan",
         after_help = "Message selection order: fetch recent turns with --max-turns, flatten user/assistant messages, apply --since, apply --role, then apply --last.\n\n--max-turns is the recent turn scan window, not the final message display limit. Use --last for the final number of messages to print. Role filters only see messages inside the scanned turns, so widen --max-turns when searching for sparse or older roles.\n\nThere is no messages --first. For beginning-of-thread or older exact paging, use show --asc and/or show --cursor with the needed --items view."
@@ -56,6 +54,10 @@ pub enum Command {
     New(NewCommand),
     Fork(ForkCommand),
     Send(SendCommand),
+    Wait(WaitCommand),
+    Result(ResultCommand),
+    Events(EventsCommand),
+    Inject(InjectCommand),
     Settings(SettingsCommand),
     Status(StatusCommand),
     Steer(SteerCommand),
@@ -193,33 +195,6 @@ pub struct ShowCommand {
     pub json: bool,
 }
 
-#[cfg(feature = "tui")]
-#[derive(Debug, Args)]
-pub struct TuiCommand {
-    #[command(flatten)]
-    pub server: ServerOpt,
-    #[arg(long)]
-    pub query: Option<String>,
-    #[arg(long)]
-    pub since: Option<String>,
-    #[arg(long)]
-    pub cwd: Option<String>,
-    #[arg(long)]
-    pub archived: bool,
-    #[arg(long = "provider", value_name = "PROVIDER")]
-    pub model_providers: Vec<String>,
-    #[arg(long = "source", value_enum)]
-    pub source_kinds: Vec<ThreadSourceKind>,
-    #[arg(long)]
-    pub limit: Option<u32>,
-    #[arg(long, value_enum)]
-    pub sort: Option<SortKey>,
-    #[arg(long, conflicts_with = "desc")]
-    pub asc: bool,
-    #[arg(long)]
-    pub desc: bool,
-}
-
 #[derive(Debug, Args)]
 pub struct MessagesCommand {
     #[command(flatten)]
@@ -311,6 +286,76 @@ pub struct SendCommand {
     pub stream: bool,
     #[arg(long = "no-wait")]
     pub no_wait: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WaitCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    pub turn_id: String,
+    #[arg(long, default_value_t = 3600)]
+    pub timeout: u64,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ResultCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    pub turn_id: String,
+    #[arg(long, default_value_t = 200)]
+    pub max_turns: u32,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EventsCommand {
+    #[command(subcommand)]
+    pub command: EventsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EventsSubcommand {
+    #[command(about = "Follow normalized events for an existing turn as NDJSON")]
+    Follow(EventsFollowCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct EventsFollowCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    pub turn_id: String,
+    #[arg(long, default_value_t = 3600)]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct InjectCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    #[arg(
+        long,
+        value_name = "JSON",
+        conflicts_with = "items_file",
+        required_unless_present = "items_file"
+    )]
+    pub items_json: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "items_json",
+        required_unless_present = "items_json",
+        help = "Read a JSON array from PATH, or from stdin when PATH is -"
+    )]
+    pub items_file: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]

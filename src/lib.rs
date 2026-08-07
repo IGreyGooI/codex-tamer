@@ -9,8 +9,6 @@ mod rate_limit_reset;
 mod rpc;
 mod session;
 mod time_filter;
-#[cfg(feature = "tui")]
-mod tui;
 mod turns;
 
 pub async fn run() -> i32 {
@@ -19,8 +17,6 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "tui")]
-    use super::config::resolve_tui_targets;
     use super::config::{
         AppConfig, Endpoint, ServerConfig, resolve_config_path_from, resolve_direct_target,
         resolve_target_from, validate_config,
@@ -45,7 +41,7 @@ mod tests {
         );
         assert_eq!(
             resolve_config_path_from(None, None, &home),
-            PathBuf::from("/home/tester/.config/codex-threads/config.toml")
+            PathBuf::from("/home/tester/.config/codex-tamer/config.toml")
         );
     }
 
@@ -192,32 +188,6 @@ allow_rate_limit_reset = true
         assert_eq!(target.server, "main");
         assert_eq!(target.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(target.model_reasoning_effort.as_deref(), Some("high"));
-    }
-
-    #[cfg(feature = "tui")]
-    #[test]
-    fn tui_target_resolution_defaults_to_all_servers_and_flag_narrows() {
-        let mut servers = BTreeMap::new();
-        servers.insert("main".to_string(), server("unix:///tmp/main.sock"));
-        servers.insert("work".to_string(), server("unix:///tmp/work.sock"));
-        let config = AppConfig {
-            model: None,
-            model_reasoning_effort: None,
-            servers,
-        };
-
-        let targets = resolve_tui_targets(&config, None).unwrap();
-        assert_eq!(
-            targets
-                .iter()
-                .map(|target| target.server.as_str())
-                .collect::<Vec<_>>(),
-            vec!["main", "work"]
-        );
-
-        let targets = resolve_tui_targets(&config, Some("work")).unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].server, "work");
     }
 
     #[test]

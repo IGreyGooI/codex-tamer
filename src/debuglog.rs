@@ -1,6 +1,6 @@
 //! Opt-in NDJSON diagnostic logging for app-server traffic.
 //!
-//! Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to append one line per
+//! Set `CODEX_TAMER_RPC_LOG=/path/to/rpc.ndjson` to append one line per
 //! JSON-RPC frame sent or received, tagged with a millisecond timestamp and a
 //! per-connection id, plus producer-side decisions such as attach replay
 //! reconciliation. The file is shared by every connection in the process;
@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-const ENV_VAR: &str = "CODEX_THREADS_RPC_LOG";
+const ENV_VAR: &str = "CODEX_TAMER_RPC_LOG";
 
 static LOG_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);

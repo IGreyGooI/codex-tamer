@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Release script for codex-threads.
+ * Release script for codex-tamer.
  *
  * Usage:
  *   node scripts/release.mjs current
@@ -10,14 +10,9 @@
  *   node scripts/release.mjs 0.2.3
  */
 
-import { execFileSync, execSync } from "node:child_process";
-import {
-	existsSync,
-	readFileSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -27,10 +22,9 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
-const PACKAGE_NAME = "codex-threads";
-const REPO = "kcosr/codex-threads";
+const PACKAGE_NAME = "codex-tamer";
+const RELEASE_REPOSITORY = "IGreyGooI/codex-tamer";
 const RELEASE_BRANCH = "main";
-const RELEASE_ARG = process.argv[2];
 const BUMP_ARGS = new Set(["major", "minor", "patch"]);
 const VERSION_ARG = /^\d+\.\d+\.\d+$/;
 const cargoTomlPath = join(ROOT, "Cargo.toml");
@@ -38,32 +32,102 @@ const cargoLockPath = join(ROOT, "Cargo.lock");
 const changelogPath = join(ROOT, "CHANGELOG.md");
 const compatibilityPath = join(ROOT, "CODEX_COMPATIBILITY.md");
 
-if (
-	!RELEASE_ARG ||
-	(!BUMP_ARGS.has(RELEASE_ARG) &&
-		RELEASE_ARG !== "current" &&
-		!VERSION_ARG.test(RELEASE_ARG))
-) {
-	console.error("Usage: node scripts/release.mjs <current|major|minor|patch|X.Y.Z>");
-	process.exit(1);
+export function releaseRemoteFromEnvironment(environment = process.env) {
+	const configured = environment.CODEX_TAMER_RELEASE_REMOTE;
+	const releaseRemote = configured === undefined ? "upstream" : String(configured);
+	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(releaseRemote)) {
+		throw new Error("invalid release remote; set CODEX_TAMER_RELEASE_REMOTE to a git remote name");
+	}
+	return releaseRemote;
 }
 
-function run(cmd, options = {}) {
-	console.log(`$ ${cmd}`);
-	try {
-		return execSync(cmd, {
-			encoding: "utf-8",
-			stdio: options.silent ? "pipe" : "inherit",
-			cwd: ROOT,
-			...options,
-		});
-	} catch (error) {
-		if (!options.ignoreError) {
-			console.error(`Command failed: ${cmd}`);
-			process.exit(1);
+function repositoryFromGitHubPushUrl(pushUrl) {
+	const scpMatch = String(pushUrl).match(/^git@github\.com:(.+)$/i);
+	let repositoryPath;
+	if (scpMatch) {
+		repositoryPath = scpMatch[1];
+	} else {
+		let parsed;
+		try {
+			parsed = new URL(String(pushUrl));
+		} catch {
+			throw new Error("invalid GitHub push URL for codex-tamer release remote");
 		}
-		return null;
+		const validHttps =
+			parsed.protocol === "https:" &&
+			parsed.username === "" &&
+			parsed.password === "" &&
+			parsed.port === "";
+		const validSsh =
+			parsed.protocol === "ssh:" &&
+			parsed.username === "git" &&
+			parsed.password === "" &&
+			(parsed.port === "" || parsed.port === "22");
+		if (
+			parsed.hostname.toLowerCase() !== "github.com" ||
+			(!validHttps && !validSsh) ||
+			parsed.search !== "" ||
+			parsed.hash !== ""
+		) {
+			throw new Error("invalid GitHub push URL for codex-tamer release remote");
+		}
+		repositoryPath = parsed.pathname;
 	}
+
+	const repository = repositoryPath.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+	if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+		throw new Error("invalid GitHub push URL for codex-tamer release remote");
+	}
+	return repository;
+}
+
+export function validateReleasePushUrl(pushUrl) {
+	const repository = repositoryFromGitHubPushUrl(pushUrl);
+	if (repository.toLowerCase() !== RELEASE_REPOSITORY.toLowerCase()) {
+		throw new Error(
+			`release remote repository ${repository} does not match ${RELEASE_REPOSITORY}`,
+		);
+	}
+	return repository;
+}
+
+export function releaseNotesFromChangelog(content, version) {
+	if (typeof content !== "string" || !VERSION_ARG.test(String(version))) {
+		throw new Error("release notes require changelog text and a stable semantic version");
+	}
+	const lines = content.split(/\r?\n/);
+	const heading = `## [${version}]`;
+	const start = lines.findIndex((line) => line === heading || line.startsWith(`${heading} - `));
+	if (start === -1) {
+		throw new Error(`CHANGELOG.md has no release section for ${version}`);
+	}
+	const nextHeading = lines.findIndex(
+		(line, index) => index > start && line.startsWith("## ["),
+	);
+	const notes = lines
+		.slice(start + 1, nextHeading === -1 ? undefined : nextHeading)
+		.join("\n")
+		.trim();
+	if (!notes) {
+		throw new Error(`CHANGELOG.md release section for ${version} is empty`);
+	}
+	return notes;
+}
+
+export function releasePreflightCommands(nodeExecutable, testPaths) {
+	if (!nodeExecutable || !Array.isArray(testPaths) || testPaths.length === 0) {
+		throw new Error("release preflight requires Node.js and at least one test file");
+	}
+	return [
+		[nodeExecutable, ["--test", "--experimental-test-coverage", ...testPaths]],
+		["cargo", ["fmt", "--check"]],
+		["cargo", ["test", "--locked"]],
+		[
+			"cargo",
+			["clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"],
+		],
+		["cargo", ["build", "--locked", "--release"]],
+	];
 }
 
 function runFile(command, args, options = {}) {
@@ -164,14 +228,14 @@ function updateCargoLockVersion(newVersion) {
 }
 
 function ensureCleanMain() {
-	const branch = run("git branch --show-current", { silent: true }).trim();
+	const branch = runFile("git", ["branch", "--show-current"], { silent: true }).trim();
 	if (branch !== RELEASE_BRANCH) {
 		console.error(
 			`Error: releases must be run from ${RELEASE_BRANCH}; current branch is ${branch || "(detached)"}.`
 		);
 		process.exit(1);
 	}
-	const status = run("git status --porcelain", { silent: true });
+	const status = runFile("git", ["status", "--porcelain"], { silent: true });
 	if (status && status.trim()) {
 		console.error("Error: Uncommitted changes detected. Commit or stash first.");
 		console.error(status);
@@ -180,37 +244,47 @@ function ensureCleanMain() {
 }
 
 function ensureTools() {
-	run("git --version", { silent: true });
-	run("node --version", { silent: true });
-	run("cargo --version", { silent: true });
-	run("gh --version", { silent: true });
-	run("gh auth status --hostname github.com", { silent: true });
+	runFile("git", ["--version"], { silent: true });
+	runFile(process.execPath, ["--version"], { silent: true });
+	runFile("cargo", ["--version"], { silent: true });
 }
 
-function ensureSyncedMain() {
+function ensureReleasePushTarget(releaseRemote) {
+	const pushUrl = runFile("git", ["remote", "get-url", "--push", releaseRemote], {
+		silent: true,
+	}).trim();
+	try {
+		validateReleasePushUrl(pushUrl);
+	} catch (error) {
+		console.error(`Error: ${error.message}`);
+		process.exit(1);
+	}
+}
+
+function ensureSyncedMain(releaseRemote) {
 	runFile(
 		"git",
 		[
 			"fetch",
-			"origin",
-			`refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}`,
+			releaseRemote,
+			`refs/heads/${RELEASE_BRANCH}:refs/remotes/${releaseRemote}/${RELEASE_BRANCH}`,
 		],
 		{ silent: true }
 	);
 	const local = runFile("git", ["rev-parse", RELEASE_BRANCH], { silent: true }).trim();
-	const remote = runFile("git", ["rev-parse", `origin/${RELEASE_BRANCH}`], {
+	const remote = runFile("git", ["rev-parse", `${releaseRemote}/${RELEASE_BRANCH}`], {
 		silent: true,
 	}).trim();
 	if (local !== remote) {
 		console.error(
-			`Error: ${RELEASE_BRANCH} must match origin/${RELEASE_BRANCH}. Run git pull --ff-only first.`
+			`Error: ${RELEASE_BRANCH} must match ${releaseRemote}/${RELEASE_BRANCH}. Run git pull --ff-only first.`,
 		);
 		process.exit(1);
 	}
 }
 
-function ensureTagAvailable(version) {
-	const tagExists = run(`git rev-parse -q --verify refs/tags/v${version}`, {
+function ensureTagAvailable(version, releaseRemote) {
+	const tagExists = runFile("git", ["rev-parse", "-q", "--verify", `refs/tags/v${version}`], {
 		silent: true,
 		ignoreError: true,
 	});
@@ -219,11 +293,13 @@ function ensureTagAvailable(version) {
 		process.exit(1);
 	}
 
-	const remoteTagExists = run(`git ls-remote --tags origin refs/tags/v${version}`, {
-		silent: true,
-	});
+	const remoteTagExists = runFile(
+		"git",
+		["ls-remote", "--tags", releaseRemote, `refs/tags/v${version}`],
+		{ silent: true },
+	);
 	if (remoteTagExists && remoteTagExists.trim()) {
-		console.error(`Error: tag v${version} already exists on origin.`);
+		console.error(`Error: tag v${version} already exists on ${releaseRemote}.`);
 		process.exit(1);
 	}
 }
@@ -270,18 +346,6 @@ function validateCompatibilityForRelease() {
 	}
 }
 
-function extractReleaseNotes(version) {
-	const content = readFileSync(changelogPath, "utf-8");
-	const versionEscaped = escapeRegex(version);
-	const regex = new RegExp(`## \\[${versionEscaped}\\][^\\n]*\\n([\\s\\S]*?)(?=\\n## \\[|$)`);
-	const match = content.match(regex);
-	if (!match) {
-		console.error(`Error: Could not extract release notes for v${version}`);
-		process.exit(1);
-	}
-	return match[1].trim();
-}
-
 function addUnreleasedSection() {
 	let content = readFileSync(changelogPath, "utf-8");
 	const original = content;
@@ -293,74 +357,79 @@ function addUnreleasedSection() {
 	writeFileSync(changelogPath, content, "utf-8");
 }
 
-const currentVersion = getVersion();
-const version = RELEASE_ARG === "current" ? currentVersion : bumpVersion(currentVersion, RELEASE_ARG);
-
-if (!VERSION_ARG.test(version)) {
-	console.error(`Release version "${version}" must be stable semver (X.Y.Z)`);
-	process.exit(1);
-}
-
-ensureCleanMain();
-ensureTools();
-ensureSyncedMain();
-ensureTagAvailable(version);
-validateChangelogForRelease(version);
-validateCompatibilityForRelease();
-run("cargo check");
-
-if (version !== currentVersion) {
-	updateCargoTomlVersion(version);
-	updateCargoLockVersion(version);
-}
-
-updateChangelogForRelease(version);
-const compatibilityUpdated = updateCompatibilityForRelease(compatibilityPath, version);
-const releaseCommitPaths = ["Cargo.toml", "CHANGELOG.md"];
-if (existsSync(cargoLockPath)) {
-	releaseCommitPaths.splice(1, 0, "Cargo.lock");
-}
-if (compatibilityUpdated) {
-	releaseCommitPaths.push("CODEX_COMPATIBILITY.md");
-}
-runFile("git", ["add", ...releaseCommitPaths]);
-runFile("git", ["commit", "-m", `Release v${version}`]);
-runFile("git", ["tag", `v${version}`]);
-runFile("git", ["push", "--atomic", "origin", RELEASE_BRANCH, `v${version}`]);
-
-const notesFile = join(ROOT, ".release-notes-tmp.md");
-writeFileSync(notesFile, extractReleaseNotes(version), "utf-8");
-let releaseCreated = false;
-try {
-	releaseCreated =
-		runFile(
-			"gh",
-			[
-				"release",
-				"create",
-				`v${version}`,
-				"--repo",
-				REPO,
-				"--title",
-				`v${version}`,
-				"--notes-file",
-				notesFile,
-			],
-			{ ignoreError: true, silent: true }
-		) !== null;
-} finally {
-	if (existsSync(notesFile)) {
-		unlinkSync(notesFile);
+function runReleasePreflight() {
+	const testPaths = readdirSync(join(ROOT, "scripts"), { withFileTypes: true })
+		.filter((entry) => entry.isFile() && entry.name.endsWith(".test.mjs"))
+		.map((entry) => join("scripts", entry.name))
+		.sort();
+	for (const [command, args] of releasePreflightCommands(process.execPath, testPaths)) {
+		runFile(command, args);
 	}
 }
-if (!releaseCreated) {
-	console.error(
-		`Error: GitHub release v${version} was not created. The release commit and tag are already pushed; create the GitHub release manually for v${version}, then add the next [Unreleased] section as documented.`
-	);
-	process.exit(1);
+
+function main(args = process.argv.slice(2), environment = process.env) {
+	const releaseArg = args[0];
+	if (
+		args.length !== 1 ||
+		!releaseArg ||
+		(!BUMP_ARGS.has(releaseArg) && releaseArg !== "current" && !VERSION_ARG.test(releaseArg))
+	) {
+		console.error("Usage: node scripts/release.mjs <current|major|minor|patch|X.Y.Z>");
+		process.exit(1);
+	}
+
+	let releaseRemote;
+	try {
+		releaseRemote = releaseRemoteFromEnvironment(environment);
+	} catch (error) {
+		console.error(`Error: ${error.message}`);
+		process.exit(1);
+	}
+
+	const currentVersion = getVersion();
+	const version =
+		releaseArg === "current" ? currentVersion : bumpVersion(currentVersion, releaseArg);
+	if (!VERSION_ARG.test(version)) {
+		console.error(`Release version "${version}" must be stable semver (X.Y.Z)`);
+		process.exit(1);
+	}
+
+	ensureCleanMain();
+	ensureTools();
+	ensureReleasePushTarget(releaseRemote);
+	ensureSyncedMain(releaseRemote);
+	ensureTagAvailable(version, releaseRemote);
+	validateChangelogForRelease(version);
+	validateCompatibilityForRelease();
+
+	if (version !== currentVersion) {
+		updateCargoTomlVersion(version);
+		updateCargoLockVersion(version);
+	}
+	updateChangelogForRelease(version);
+	const compatibilityUpdated = updateCompatibilityForRelease(compatibilityPath, version);
+
+	runReleasePreflight();
+
+	const releaseCommitPaths = ["Cargo.toml", "CHANGELOG.md"];
+	if (existsSync(cargoLockPath)) {
+		releaseCommitPaths.splice(1, 0, "Cargo.lock");
+	}
+	if (compatibilityUpdated) {
+		releaseCommitPaths.push("CODEX_COMPATIBILITY.md");
+	}
+	runFile("git", ["add", ...releaseCommitPaths]);
+	runFile("git", ["commit", "-m", `Release v${version}`]);
+	runFile("git", ["tag", `v${version}`]);
+	runFile("git", ["push", "--atomic", releaseRemote, RELEASE_BRANCH, `v${version}`]);
+
+	addUnreleasedSection();
+	runFile("git", ["add", "CHANGELOG.md"]);
+	runFile("git", ["commit", "-m", "Prepare for next release"]);
+	runFile("git", ["push", releaseRemote, RELEASE_BRANCH]);
 }
 
-addUnreleasedSection();
-runFile("git", ["add", "CHANGELOG.md"]);
-runFile("git", ["commit", "-m", "Prepare for next release"]);
-runFile("git", ["push", "origin", RELEASE_BRANCH]);
+const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;
+if (invokedPath === fileURLToPath(import.meta.url)) {
+	main();
+}

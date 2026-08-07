@@ -240,60 +240,6 @@ fn occurrence_search_result(
     })
 }
 
-#[cfg(feature = "tui")]
-pub async fn set_thread_archived(
-    target: &Target,
-    client: &mut RpcClient,
-    thread_id: String,
-    archived: bool,
-) -> Result<Value> {
-    let method = if archived {
-        "thread/archive"
-    } else {
-        "thread/unarchive"
-    };
-    let result = client
-        .request(method, json!({"threadId": thread_id}), |_| {})
-        .await?;
-    Ok(json!({
-        "server": target.server,
-        "threadId": thread_id,
-        "archived": archived,
-        "status": "accepted",
-        "thread": result.get("thread").cloned().unwrap_or(Value::Null)
-    }))
-}
-
-#[cfg(feature = "tui")]
-pub async fn set_thread_name(
-    target: &Target,
-    client: &mut RpcClient,
-    thread_id: String,
-    name: String,
-) -> Result<Value> {
-    let result = client
-        .request(
-            "thread/name/set",
-            json!({"threadId": thread_id, "name": name}),
-            |_| {},
-        )
-        .await?;
-    Ok(json!({
-        "server": target.server,
-        "threadId": thread_id,
-        "name": name,
-        "status": "accepted",
-        "thread": result.get("thread").cloned().unwrap_or(Value::Null)
-    }))
-}
-
-#[cfg(feature = "tui")]
-pub async fn delete_thread(client: &mut RpcClient, thread_id: &str) -> Result<Value> {
-    client
-        .request("thread/delete", json!({"threadId": thread_id}), |_| {})
-        .await
-}
-
 pub async fn read_thread_detail(
     target: &Target,
     client: &mut RpcClient,
@@ -878,7 +824,7 @@ fn turn_status(turn: &Value) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod occurrence_search_tests {
     use std::path::PathBuf;
 

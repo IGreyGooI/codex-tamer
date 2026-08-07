@@ -1,4 +1,5 @@
 /target
+/dist
 /.scratch/
 /.pytest_cache
 /smoke/.venv

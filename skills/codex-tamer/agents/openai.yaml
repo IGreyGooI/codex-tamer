@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Tamer"
+  short_description: "Control Codex threads from another Agent"
+  default_prompt: "Use $codex-tamer to inspect active Codex threads and safely continue the relevant one."

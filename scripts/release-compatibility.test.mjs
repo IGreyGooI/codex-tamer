@@ -10,7 +10,7 @@ import {
 } from "./release-compatibility.mjs";
 
 function withTempDirectory(run) {
-	const directory = mkdtempSync(join(tmpdir(), "codex-threads-release-test-"));
+	const directory = mkdtempSync(join(tmpdir(), "codex-tamer-release-test-"));
 	try {
 		run(directory);
 	} finally {
@@ -24,7 +24,7 @@ test("stamps the Unreleased compatibility row", () => {
 		writeFileSync(
 			path,
 			[
-				"| codex-threads | Codex app release |",
+				"| codex-tamer | Codex app release |",
 				"| --- | --- |",
 				"| Unreleased | 0.146 |",
 				"",
@@ -39,7 +39,7 @@ test("stamps the Unreleased compatibility row", () => {
 test("leaves a compatibility ledger without an Unreleased row unchanged", () => {
 	withTempDirectory((directory) => {
 		const path = join(directory, "CODEX_COMPATIBILITY.md");
-		const content = "| codex-threads | Codex app release |\n| 0.2.3 | 0.143 |\n";
+		const content = "| codex-tamer | Codex app release |\n| 0.2.3 | 0.143 |\n";
 		writeFileSync(path, content);
 
 		assert.equal(updateCompatibilityForRelease(path, "0.3.0"), false);

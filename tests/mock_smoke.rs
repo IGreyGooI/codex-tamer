@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener as StdTcpListener;
@@ -29,6 +31,8 @@ struct TcpMockServer {
     endpoint: String,
     config: PathBuf,
 }
+
+type ResponseOverrides = Arc<HashMap<String, Value>>;
 
 #[derive(Clone)]
 struct GoalState {
@@ -85,11 +89,12 @@ impl TcpMockServer {
                         handle_websocket(
                             websocket,
                             received,
-                            TurnNotificationMode::Complete,
-                            false,
-                            RejectFirst::none(),
-                            Arc::new(Mutex::new(false)),
-                            Arc::new(Mutex::new(HashMap::new())),
+                            MockBehavior::new(
+                                TurnNotificationMode::Complete,
+                                false,
+                                RejectFirst::none(),
+                                Arc::new(HashMap::new()),
+                            ),
                         )
                         .await;
                     });
@@ -105,11 +110,11 @@ impl TcpMockServer {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::cargo_bin("codex-threads").expect("binary");
+        let mut command = Command::cargo_bin("codex-tamer").expect("binary");
         command
-            .env_remove("CODEX_THREADS_CONFIG")
-            .env_remove("CODEX_THREADS_SERVER")
-            .env_remove("CODEX_THREADS_STATE")
+            .env_remove("CODEX_TAMER_CONFIG")
+            .env_remove("CODEX_TAMER_SERVER")
+            .env_remove("CODEX_TAMER_STATE")
             .env_remove("XDG_STATE_HOME")
             .arg("--config")
             .arg(&self.config);
@@ -142,6 +147,7 @@ enum RejectFirstMethod {
     TurnStart,
     TurnSteer,
     SettingsUpdate,
+    TurnsList,
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +196,34 @@ impl RejectFirst {
             code: -32600,
             message: None,
             fail_usage_refresh_after_redemption: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MockBehavior {
+    turn_notification_mode: TurnNotificationMode,
+    malformed_turn_start: bool,
+    reject_first: RejectFirst,
+    rejected_first_method: Arc<Mutex<bool>>,
+    goal_state: Arc<Mutex<HashMap<String, GoalState>>>,
+    response_overrides: ResponseOverrides,
+}
+
+impl MockBehavior {
+    fn new(
+        turn_notification_mode: TurnNotificationMode,
+        malformed_turn_start: bool,
+        reject_first: RejectFirst,
+        response_overrides: ResponseOverrides,
+    ) -> Self {
+        Self {
+            turn_notification_mode,
+            malformed_turn_start,
+            reject_first,
+            rejected_first_method: Arc::new(Mutex::new(false)),
+            goal_state: Arc::new(Mutex::new(HashMap::new())),
+            response_overrides,
         }
     }
 }
@@ -247,6 +281,21 @@ impl MockServer {
         )
     }
 
+    fn start_with_unmaterialized_first_poll() -> Self {
+        Self::start_rejecting_first_turns_list_with(
+            -32600,
+            "thread thread_1 is not materialized yet; thread/turns/list is unavailable before first user message",
+        )
+    }
+
+    fn start_rejecting_first_turns_list_with(code: i64, message: &'static str) -> Self {
+        Self::start_with_options(
+            TurnNotificationMode::None,
+            false,
+            RejectFirst::method_with_error(RejectFirstMethod::TurnsList, code, message),
+        )
+    }
+
     fn start_with_wrong_turn_completion() -> Self {
         Self::start_with_options(
             TurnNotificationMode::WrongTurnCompleted,
@@ -272,6 +321,30 @@ impl MockServer {
         malformed_turn_start: bool,
         reject_first: RejectFirst,
     ) -> Self {
+        Self::start_with_options_and_responses(
+            turn_notification_mode,
+            malformed_turn_start,
+            reject_first,
+            Arc::new(HashMap::new()),
+        )
+    }
+
+    fn start_with_response(method: &str, response: Value) -> Self {
+        let responses = HashMap::from([(method.to_string(), response)]);
+        Self::start_with_options_and_responses(
+            TurnNotificationMode::Complete,
+            false,
+            RejectFirst::none(),
+            Arc::new(responses),
+        )
+    }
+
+    fn start_with_options_and_responses(
+        turn_notification_mode: TurnNotificationMode,
+        malformed_turn_start: bool,
+        reject_first: RejectFirst,
+        response_overrides: ResponseOverrides,
+    ) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let socket = temp.path().join("codex.sock");
         let config = temp.path().join("config.toml");
@@ -287,10 +360,12 @@ impl MockServer {
         std_listener.set_nonblocking(true).expect("nonblocking");
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_for_thread = Arc::clone(&received);
-        let goal_state = Arc::new(Mutex::new(HashMap::new()));
-        let goal_state_for_thread = Arc::clone(&goal_state);
-        let rejected_first_method = Arc::new(Mutex::new(false));
-        let rejected_first_method_for_thread = Arc::clone(&rejected_first_method);
+        let behavior = MockBehavior::new(
+            turn_notification_mode,
+            malformed_turn_start,
+            reject_first,
+            response_overrides,
+        );
         thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("runtime");
             runtime.block_on(async move {
@@ -298,19 +373,9 @@ impl MockServer {
                 loop {
                     let (stream, _) = listener.accept().await.expect("accept");
                     let received = Arc::clone(&received_for_thread);
-                    let rejected_first_method = Arc::clone(&rejected_first_method_for_thread);
-                    let goal_state = Arc::clone(&goal_state_for_thread);
+                    let behavior = behavior.clone();
                     tokio::spawn(async move {
-                        handle_connection(
-                            stream,
-                            received,
-                            turn_notification_mode,
-                            malformed_turn_start,
-                            reject_first,
-                            rejected_first_method,
-                            goal_state,
-                        )
-                        .await;
+                        handle_connection(stream, received, behavior).await;
                     });
                 }
             });
@@ -329,11 +394,23 @@ impl MockServer {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::cargo_bin("codex-threads").expect("binary");
+        let mut command = Command::cargo_bin("codex-tamer").expect("binary");
         command
-            .env_remove("CODEX_THREADS_CONFIG")
-            .env_remove("CODEX_THREADS_SERVER")
-            .env_remove("CODEX_THREADS_STATE")
+            .env_remove("CODEX_TAMER_CONFIG")
+            .env_remove("CODEX_TAMER_SERVER")
+            .env_remove("CODEX_TAMER_STATE")
+            .env_remove("XDG_STATE_HOME")
+            .arg("--config")
+            .arg(&self.config);
+        command
+    }
+
+    fn std_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("codex-tamer"));
+        command
+            .env_remove("CODEX_TAMER_CONFIG")
+            .env_remove("CODEX_TAMER_SERVER")
+            .env_remove("CODEX_TAMER_STATE")
             .env_remove("XDG_STATE_HOME")
             .arg("--config")
             .arg(&self.config);
@@ -372,33 +449,16 @@ impl MockServer {
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     received: Arc<Mutex<Vec<Value>>>,
-    turn_notification_mode: TurnNotificationMode,
-    malformed_turn_start: bool,
-    reject_first: RejectFirst,
-    rejected_first_method: Arc<Mutex<bool>>,
-    goal_state: Arc<Mutex<HashMap<String, GoalState>>>,
+    behavior: MockBehavior,
 ) {
     let ws = accept_async(stream).await.expect("websocket accept");
-    handle_websocket(
-        ws,
-        received,
-        turn_notification_mode,
-        malformed_turn_start,
-        reject_first,
-        rejected_first_method,
-        goal_state,
-    )
-    .await;
+    handle_websocket(ws, received, behavior).await;
 }
 
 async fn handle_websocket<S>(
     mut ws: tokio_tungstenite::WebSocketStream<S>,
     received: Arc<Mutex<Vec<Value>>>,
-    turn_notification_mode: TurnNotificationMode,
-    malformed_turn_start: bool,
-    reject_first: RejectFirst,
-    rejected_first_method: Arc<Mutex<bool>>,
-    goal_state: Arc<Mutex<HashMap<String, GoalState>>>,
+    behavior: MockBehavior,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -444,15 +504,20 @@ async fn handle_websocket<S>(
                     }
                     continue;
                 }
-                if should_reject_first_method(method, reject_first.method, &rejected_first_method) {
-                    let message = reject_first
+                if should_reject_first_method(
+                    method,
+                    behavior.reject_first.method,
+                    &behavior.rejected_first_method,
+                ) {
+                    let message = behavior
+                        .reject_first
                         .message
                         .map(ToString::to_string)
                         .unwrap_or_else(|| format!("thread not found: {}", thread_id(&value)));
                     let response = json!({
                         "id": id,
                         "error": {
-                            "code": reject_first.code,
+                            "code": behavior.reject_first.code,
                             "message": message
                         }
                     });
@@ -465,7 +530,7 @@ async fn handle_websocket<S>(
                     }
                     continue;
                 }
-                if reject_first.fail_usage_refresh_after_redemption
+                if behavior.reject_first.fail_usage_refresh_after_redemption
                     && method == "account/rateLimits/read"
                     && received.lock().expect("received").iter().any(|request| {
                         request["method"].as_str() == Some("account/rateLimitResetCredit/consume")
@@ -487,10 +552,51 @@ async fn handle_websocket<S>(
                     }
                     continue;
                 }
-                let result = mock_result(method, &value, malformed_turn_start, &goal_state);
+                if method == "thread/turns/list" && thread_id(&value) == "thread_hung_poll" {
+                    continue;
+                }
+                if method == "thread/resume" && thread_id(&value) == "thread_hung_resume" {
+                    continue;
+                }
+                if method == "thread/turns/list"
+                    && thread_id(&value) == "thread_unmaterialized_terminal"
+                {
+                    send_terminal_notification(&mut ws, "thread_unmaterialized_terminal").await;
+                    let response = json!({
+                        "id": id,
+                        "error": {
+                            "code": -32600,
+                            "message": "thread thread_unmaterialized_terminal is not materialized yet"
+                        }
+                    });
+                    if ws
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if method == "thread/resume" && thread_id(&value) == "thread_snapshot_replay" {
+                    send_snapshot_replay_notifications(&mut ws, "thread_snapshot_replay").await;
+                }
+                let result = behavior
+                    .response_overrides
+                    .get(method)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        mock_result(
+                            method,
+                            &value,
+                            behavior.malformed_turn_start,
+                            &behavior.goal_state,
+                        )
+                    });
                 if method == "turn/start" {
                     let thread_id = value["params"]["threadId"].as_str().unwrap_or("thread_1");
-                    send_turn_notifications(&mut ws, thread_id, turn_notification_mode).await;
+                    send_turn_notifications(&mut ws, thread_id, behavior.turn_notification_mode)
+                        .await;
                 }
                 let response = json!({ "id": id, "result": result });
                 if ws
@@ -505,6 +611,61 @@ async fn handle_websocket<S>(
     }
 }
 
+async fn send_terminal_notification(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    >,
+    thread_id: &str,
+) {
+    let _ = ws
+        .send(Message::Text(
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {
+                        "id": "turn_1",
+                        "status": "completed",
+                        "items": []
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
+}
+
+async fn send_snapshot_replay_notifications(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    >,
+    thread_id: &str,
+) {
+    for notification in [
+        json!({
+            "method": "item/started",
+            "params": {
+                "threadId": thread_id,
+                "turnId": "turn_1",
+                "item": {"id": "msg_live", "type": "agentMessage"}
+            }
+        }),
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": "turn_1",
+                "item": {"id": "msg_live", "type": "agentMessage", "text": "done"}
+            }
+        }),
+    ] {
+        let _ = ws
+            .send(Message::Text(notification.to_string().into()))
+            .await;
+    }
+}
+
 fn should_reject_first_method(
     method: &str,
     reject_first_method: RejectFirstMethod,
@@ -515,6 +676,7 @@ fn should_reject_first_method(
         RejectFirstMethod::TurnStart => "turn/start",
         RejectFirstMethod::TurnSteer => "turn/steer",
         RejectFirstMethod::SettingsUpdate => "thread/settings/update",
+        RejectFirstMethod::TurnsList => "thread/turns/list",
     };
     if method != expected {
         return false;
@@ -540,6 +702,11 @@ async fn send_turn_notifications(
         TurnNotificationMode::Failed => ("turn_1", "failed", "failed"),
         TurnNotificationMode::UnknownStatus => ("turn_1", "mystery", "mystery"),
         TurnNotificationMode::None => return,
+    };
+    let terminal_error = if matches!(mode, TurnNotificationMode::Failed) {
+        json!({"code": "mock_failure", "message": "mock turn failed"})
+    } else {
+        Value::Null
     };
     let _ = ws
         .send(Message::Text(
@@ -580,7 +747,12 @@ async fn send_turn_notifications(
                 "method": "turn/completed",
                 "params": {
                     "threadId": thread_id,
-                    "turn": { "id": turn_id, "status": terminal_status, "items": [] }
+                    "turn": {
+                        "id": turn_id,
+                        "status": terminal_status,
+                        "items": [],
+                        "error": terminal_error
+                    }
                 }
             })
             .to_string()
@@ -646,6 +818,24 @@ fn mock_result(
             }
             json!({ "thread": thread })
         }
+        "thread/turns/list" if thread_id(request) == "thread_result_paged" => {
+            paged_turn_results(request)
+        }
+        "thread/turns/list" if thread_id(request) == "thread_result_empty_page" => json!({
+            "data": [],
+            "nextCursor": "unique-empty-page"
+        }),
+        "thread/turns/list" if thread_id(request) == "thread_invalid_next_cursor" => json!({
+            "data": [{"id": "turn_other", "status": "completed", "items": []}],
+            "nextCursor": 7
+        }),
+        "thread/turns/list" if thread_id(request) == "thread_missing_turn_data" => json!({}),
+        "thread/turns/list" if thread_id(request) == "thread_missing_status" => {
+            page(json!([{"id": "turn_bad", "items": []}]))
+        }
+        "thread/turns/list" if thread_id(request) == "thread_invalid_status" => {
+            page(json!([{"id": "turn_bad", "status": 7, "items": []}]))
+        }
         "thread/turns/list" => page(json!([sample_turn()])),
         "thread/start" => json!({
             "thread": sample_thread("thread_new"),
@@ -677,6 +867,15 @@ fn mock_result(
             if thread_id(request) == "thread_denied_after_resume" {
                 thread["canAcceptDirectInput"] = json!(false);
             }
+            let mut turn = sample_turn();
+            if matches!(
+                thread_id(request),
+                "thread_hung_poll" | "thread_missing_turn_data"
+            ) {
+                turn["status"] = json!("inProgress");
+                turn["completedAt"] = Value::Null;
+            }
+            thread["turns"] = json!([turn]);
             json!({
                 "thread": thread,
                 "threadId": thread_id(request),
@@ -687,11 +886,22 @@ fn mock_result(
             })
         }
         "thread/unsubscribe" => json!({}),
+        "thread/inject_items" if thread_id(request) == "thread_invalid_inject_result" => {
+            Value::Null
+        }
+        "thread/inject_items" => json!({}),
         "thread/settings/update" => json!({}),
         "thread/loaded/list" => page(json!(["thread_1"])),
+        "turn/steer" if thread_id(request) == "thread_mismatched_steer_result" => {
+            json!({"turnId": "turn_other"})
+        }
+        "turn/steer" if thread_id(request) == "thread_invalid_steer_result" => {
+            json!({"turnId": 7})
+        }
         "turn/steer" => {
             json!({ "turnId": request["params"]["expectedTurnId"].as_str().unwrap_or("turn_1") })
         }
+        "turn/interrupt" if thread_id(request) == "thread_invalid_interrupt_result" => Value::Null,
         "turn/interrupt" => json!({}),
         "thread/archive" => json!({}),
         "thread/unarchive" => json!({ "thread": sample_thread(thread_id(request)) }),
@@ -700,10 +910,10 @@ fn mock_result(
         "account/rateLimits/read" => sample_usage(),
         "account/rateLimitResetCredit/consume" => json!({ "outcome": "reset" }),
         "thread/goal/get" => {
-            json!({ "goal": goal_to_value(&goal_for_thread(request, goal_state)) })
+            json!({ "goal": goal_to_value(thread_id(request), &goal_for_thread(request, goal_state)) })
         }
         "thread/goal/set" => json!({
-            "goal": goal_to_value(&set_goal_for_thread(request, goal_state))
+            "goal": goal_to_value(thread_id(request), &set_goal_for_thread(request, goal_state))
         }),
         "thread/goal/clear" => {
             if let Some(thread_id) = request["params"]["threadId"].as_str() {
@@ -743,11 +953,16 @@ fn set_goal_for_thread(
     goal.clone()
 }
 
-fn goal_to_value(goal: &GoalState) -> Value {
+fn goal_to_value(thread_id: &str, goal: &GoalState) -> Value {
     json!({
+        "threadId": thread_id,
         "objective": goal.objective,
         "status": goal.status,
         "tokenBudget": goal.token_budget,
+        "tokensUsed": 0,
+        "timeUsedSeconds": 0,
+        "createdAt": 1,
+        "updatedAt": 1,
     })
 }
 
@@ -815,6 +1030,33 @@ fn paged_search_results(request: &Value) -> Value {
         "nextCursor": page["nextCursor"].clone(),
         "backwardsCursor": page["backwardsCursor"].clone()
     })
+}
+
+fn paged_turn_results(request: &Value) -> Value {
+    match request["params"]["cursor"].as_str() {
+        None => {
+            let turns = (0..100)
+                .map(|index| {
+                    json!({
+                        "id": format!("turn_recent_{index}"),
+                        "status": "completed",
+                        "items": []
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "data": turns,
+                "nextCursor": "turn-page-2",
+                "backwardsCursor": Value::Null
+            })
+        }
+        Some("turn-page-2") => {
+            let mut turn = sample_turn();
+            turn["id"] = json!("turn_target_101");
+            page(json!([turn]))
+        }
+        _ => page(json!([])),
+    }
 }
 
 fn thread_id(request: &Value) -> &str {
@@ -988,7 +1230,7 @@ fn run_json(server: &MockServer, args: &[&str]) -> Value {
 fn run_json_with_state(server: &MockServer, state: &TempDir, args: &[&str]) -> Value {
     let output = server
         .command()
-        .env("CODEX_THREADS_STATE", state.path())
+        .env("CODEX_TAMER_STATE", state.path())
         .args(args)
         .assert()
         .success()
@@ -1012,6 +1254,26 @@ fn run_ndjson(server: &MockServer, args: &[&str]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("ndjson"))
         .collect()
+}
+
+fn run_and_interrupt(server: &MockServer, args: &[&str]) -> std::process::Output {
+    let child = server
+        .std_command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "1")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn command");
+    thread::sleep(std::time::Duration::from_millis(1_500));
+    let signal = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(signal.success());
+    child
+        .wait_with_output()
+        .expect("wait for interrupted command")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1045,10 +1307,10 @@ fn assert_no_yolo_params(params: &Value) {
 #[test]
 fn connect_bypasses_config_and_lists_threads() {
     let server = MockServer::start();
-    let output = Command::cargo_bin("codex-threads")
+    let output = Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--config")
         .arg(server.config.parent().unwrap().join("missing.toml"))
         .arg("--connect")
@@ -1067,10 +1329,10 @@ fn connect_bypasses_config_and_lists_threads() {
 #[test]
 fn connect_bypasses_config_for_servers_ping() {
     let server = MockServer::start();
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--config")
         .arg(server.config.parent().unwrap().join("missing.toml"))
         .arg("--connect")
@@ -1087,10 +1349,10 @@ fn connect_bypasses_config_for_servers_ping() {
 #[test]
 fn connect_ws_bypasses_config_and_lists_threads() {
     let server = TcpMockServer::start(None);
-    let output = Command::cargo_bin("codex-threads")
+    let output = Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--config")
         .arg(server.config.parent().unwrap().join("missing.toml"))
         .arg("--connect")
@@ -1143,7 +1405,7 @@ endpoint = "{}"
 
 [servers.remote]
 endpoint = "ws://127.0.0.1:9"
-auth_token_env = "CODEX_THREADS_MISSING_TOKEN"
+auth_token_env = "CODEX_TAMER_MISSING_TOKEN"
 "#,
             server.endpoint()
         ),
@@ -1151,7 +1413,7 @@ auth_token_env = "CODEX_THREADS_MISSING_TOKEN"
 
     let output = server
         .command()
-        .env_remove("CODEX_THREADS_MISSING_TOKEN")
+        .env_remove("CODEX_TAMER_MISSING_TOKEN")
         .args(["servers", "--json"])
         .assert()
         .success()
@@ -1176,7 +1438,7 @@ endpoint = "{}"
 
 [servers.remote]
 endpoint = "ws://127.0.0.1:9"
-auth_token_env = "CODEX_THREADS_MISSING_TOKEN"
+auth_token_env = "CODEX_TAMER_MISSING_TOKEN"
 "#,
             server.endpoint()
         ),
@@ -1184,7 +1446,7 @@ auth_token_env = "CODEX_THREADS_MISSING_TOKEN"
 
     let output = server
         .command()
-        .env_remove("CODEX_THREADS_MISSING_TOKEN")
+        .env_remove("CODEX_TAMER_MISSING_TOKEN")
         .args(["servers", "ping", "--all", "--json"])
         .assert()
         .code(3)
@@ -1202,10 +1464,10 @@ auth_token_env = "CODEX_THREADS_MISSING_TOKEN"
 #[test]
 fn connect_ws_sends_literal_auth_token() {
     let server = TcpMockServer::start(Some("direct-token"));
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--connect")
         .arg(&server.endpoint)
         .arg("--connect-auth-token")
@@ -1218,15 +1480,15 @@ fn connect_ws_sends_literal_auth_token() {
 #[test]
 fn connect_ws_sends_env_auth_token() {
     let server = TcpMockServer::start(Some("env-token"));
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
-        .env("CODEX_THREADS_TEST_TOKEN", "env-token")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .env("CODEX_TAMER_TEST_TOKEN", "env-token")
         .arg("--connect")
         .arg(&server.endpoint)
         .arg("--connect-auth-token-env")
-        .arg("CODEX_THREADS_TEST_TOKEN")
+        .arg("CODEX_TAMER_TEST_TOKEN")
         .args(["models", "--json"])
         .assert()
         .success();
@@ -1235,10 +1497,10 @@ fn connect_ws_sends_env_auth_token() {
 #[test]
 fn connect_rejects_servers_ping_all() {
     let server = MockServer::start();
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--connect")
         .arg(server.endpoint())
         .args(["servers", "ping", "--all"])
@@ -1251,10 +1513,10 @@ fn connect_rejects_servers_ping_all() {
 
 #[test]
 fn connect_auth_flags_require_websocket_endpoint() {
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--connect")
         .arg("unix:///tmp/missing.sock")
         .arg("--connect-auth-token")
@@ -1269,10 +1531,10 @@ fn connect_auth_flags_require_websocket_endpoint() {
 
 #[test]
 fn connect_auth_flags_reject_non_loopback_plain_ws() {
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--connect")
         .arg("ws://example.com:8765")
         .arg("--connect-auth-token")
@@ -1285,16 +1547,16 @@ fn connect_auth_flags_reject_non_loopback_plain_ws() {
 
 #[test]
 fn connect_auth_flags_are_mutually_exclusive() {
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--connect")
         .arg("ws://127.0.0.1:8765")
         .arg("--connect-auth-token")
         .arg("secret")
         .arg("--connect-auth-token-env")
-        .arg("CODEX_THREADS_TEST_TOKEN")
+        .arg("CODEX_TAMER_TEST_TOKEN")
         .args(["models"])
         .assert()
         .code(2)
@@ -1319,10 +1581,10 @@ path = "/tmp/two.sock"
     )
     .expect("config");
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
-        .env_remove("CODEX_THREADS_CONFIG")
-        .env_remove("CODEX_THREADS_SERVER")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
         .arg("--config")
         .arg(config)
         .args(["list", "--json"])
@@ -1349,7 +1611,7 @@ path = "/tmp/personal.sock"
     )
     .expect("config");
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .env("SHELL", "/bin/bash")
         .args(["completion"])
@@ -1357,74 +1619,74 @@ path = "/tmp/personal.sock"
         .success()
         .stdout(predicates::str::contains("Detected shell: bash"))
         .stdout(predicates::str::contains(
-            "source <(codex-threads completion script bash)",
+            "source <(codex-tamer completion script bash)",
         ));
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["completion", "script", "bash"])
         .assert()
         .success()
         .stdout(predicates::str::contains("mapfile -t COMPREPLY"))
         .stdout(predicates::str::contains(
-            "complete -o bashdefault -o default -F _codex_threads_completion codex-threads",
+            "complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer",
         ))
         .stdout(predicates::str::contains(
-            "codex-threads __complete -- \"$cur\"",
+            "codex-tamer __complete -- \"$cur\"",
         ));
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["completion", "script", "zsh"])
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "compdef _codex_threads codex-threads",
+            "compdef _codex_tamer codex-tamer",
         ))
         .stdout(predicates::str::contains("_files"))
         .stdout(predicates::str::contains(
-            "codex-threads __complete -- \"$current\"",
+            "codex-tamer __complete -- \"$current\"",
         ));
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["completion", "script", "fish"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("complete -c codex-threads -a"))
+        .stdout(predicates::str::contains("complete -c codex-tamer -a"))
         .stdout(predicates::str::contains(
-            "codex-threads __complete -- \"$current\"",
+            "codex-tamer __complete -- \"$current\"",
         ));
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["__complete", "--", "l"])
         .assert()
         .success()
         .stdout(predicates::str::contains("list\n"));
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["__complete", "--", "p", "servers"])
         .assert()
         .success()
         .stdout("ping\n");
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["__complete", "--", "--so", "list"])
         .assert()
         .success()
         .stdout("--source\n--sort\n");
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["__complete", "--", "u", "list", "--sort"])
         .assert()
         .success()
         .stdout("updated\n");
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args([
             "__complete",
@@ -1440,7 +1702,7 @@ path = "/tmp/personal.sock"
         .stdout("work\n");
 
     let bash_completion = |words: &[&str], cword: usize| -> String {
-        let binary = assert_cmd::cargo::cargo_bin("codex-threads");
+        let binary = assert_cmd::cargo::cargo_bin("codex-tamer");
         let binary_dir = binary.parent().expect("binary parent");
         let path = std::env::var_os("PATH").unwrap_or_default();
         let path = std::env::join_paths(
@@ -1453,17 +1715,17 @@ path = "/tmp/personal.sock"
             .collect::<Vec<_>>()
             .join(" ");
         let script = format!(
-            "source <(codex-threads completion script bash); \
+            "source <(codex-tamer completion script bash); \
              COMP_WORDS=({words}); \
              COMP_CWORD={cword}; \
-             _codex_threads_completion; \
+             _codex_tamer_completion; \
              printf '%s\\n' \"${{COMPREPLY[@]}}\""
         );
         let output = std::process::Command::new("bash")
             .args(["--noprofile", "--norc", "-c", &script])
             .env("PATH", path)
-            .env_remove("CODEX_THREADS_CONFIG")
-            .env_remove("CODEX_THREADS_SERVER")
+            .env_remove("CODEX_TAMER_CONFIG")
+            .env_remove("CODEX_TAMER_SERVER")
             .output()
             .expect("run bash completion smoke");
         assert!(
@@ -1474,27 +1736,27 @@ path = "/tmp/personal.sock"
         String::from_utf8(output.stdout).expect("utf8 stdout")
     };
 
-    assert_eq!(bash_completion(&["codex-threads", "l"], 1), "list\n");
+    assert_eq!(bash_completion(&["codex-tamer", "l"], 1), "list\n");
     assert_eq!(
-        bash_completion(&["codex-threads", "servers", "p"], 2),
+        bash_completion(&["codex-tamer", "servers", "p"], 2),
         "ping\n"
     );
     assert_eq!(
-        bash_completion(&["codex-threads", "list", "--so"], 2),
+        bash_completion(&["codex-tamer", "list", "--so"], 2),
         "--source\n--sort\n"
     );
     assert_eq!(
-        bash_completion(&["codex-threads", "list", "--sort", "u"], 3),
+        bash_completion(&["codex-tamer", "list", "--sort", "u"], 3),
         "updated\n"
     );
     assert_eq!(
-        bash_completion(&["codex-threads", "list", "--sort=u"], 2),
+        bash_completion(&["codex-tamer", "list", "--sort=u"], 2),
         "--sort=updated\n"
     );
     assert_eq!(
         bash_completion(
             &[
-                "codex-threads",
+                "codex-tamer",
                 "--config",
                 config.to_str().expect("utf8 path"),
                 "list",
@@ -1505,7 +1767,7 @@ path = "/tmp/personal.sock"
         ),
         "work\n"
     );
-    assert!(!bash_completion(&["codex-threads", ""], 1).contains("__complete"));
+    assert!(!bash_completion(&["codex-tamer", ""], 1).contains("__complete"));
 
     let marker = temp.path().join("completion-pwned");
     let malicious_alias = format!("$(touch {})", marker.display());
@@ -1529,7 +1791,7 @@ path = "/tmp/malicious.sock"
     assert_eq!(
         bash_completion(
             &[
-                "codex-threads",
+                "codex-tamer",
                 "--config",
                 config.to_str().expect("utf8 path"),
                 "list",
@@ -1548,7 +1810,7 @@ path = "/tmp/malicious.sock"
 
 #[test]
 fn clap_value_parsers_reject_empty_static_values_before_connecting() {
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["new", "--cwd", ".", "--effort", " "])
         .assert()
@@ -1557,7 +1819,7 @@ fn clap_value_parsers_reject_empty_static_values_before_connecting() {
             "reasoning effort cannot be empty",
         ));
 
-    Command::cargo_bin("codex-threads")
+    Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["goal", "set", "thread_1", "--status", "finished"])
         .assert()
@@ -1695,7 +1957,7 @@ fn annotation_commands_manage_local_state_without_app_server() {
 
     server
         .command()
-        .env("CODEX_THREADS_STATE", state.path())
+        .env("CODEX_TAMER_STATE", state.path())
         .args(["annotate", "get", "--server", "work", "--json", "missing"])
         .assert()
         .code(2)
@@ -1764,7 +2026,7 @@ fn annotations_project_into_list_search_and_show_outputs() {
 
     let output = server
         .command()
-        .env("CODEX_THREADS_STATE", state.path())
+        .env("CODEX_TAMER_STATE", state.path())
         .args(["list", "--server", "work"])
         .assert()
         .success()
@@ -1840,7 +2102,7 @@ fn annotation_prune_removes_only_missing_threads() {
     assert_eq!(pruned["removed"], 1);
     server
         .command()
-        .env("CODEX_THREADS_STATE", state.path())
+        .env("CODEX_TAMER_STATE", state.path())
         .args([
             "annotate",
             "get",
@@ -1881,7 +2143,7 @@ fn annotation_prune_aborts_on_unexpected_thread_read_error() {
 
     server
         .command()
-        .env("CODEX_THREADS_STATE", state.path())
+        .env("CODEX_TAMER_STATE", state.path())
         .args(["annotate", "prune", "--server", "work", "--json"])
         .assert()
         .code(3)
@@ -2057,7 +2319,7 @@ fn usage_redeem_selects_and_redeems_the_soonest_expiring_credit() {
     assert!(
         params[0]["idempotencyKey"]
             .as_str()
-            .is_some_and(|key| key.starts_with("codex-threads-"))
+            .is_some_and(|key| key.starts_with("codex-tamer-"))
     );
 }
 
@@ -2111,7 +2373,7 @@ fn list_human_output_uses_compact_aligned_table() {
 
 #[test]
 fn messages_help_explains_scan_and_filter_order() {
-    let output = Command::cargo_bin("codex-threads")
+    let output = Command::cargo_bin("codex-tamer")
         .expect("binary")
         .args(["messages", "--help"])
         .assert()
@@ -2125,38 +2387,6 @@ fn messages_help_explains_scan_and_filter_order() {
     assert!(text.contains("Use --last for the final number of messages"));
     assert!(text.contains("Role filters only see messages inside the scanned turns"));
     assert!(text.contains("There is no messages --first"));
-}
-
-#[test]
-fn tui_help_exposes_interactive_filter_flags() {
-    let output = Command::cargo_bin("codex-threads")
-        .expect("binary")
-        .args(["tui", "--help"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let text = String::from_utf8(output).expect("utf8");
-    assert!(text.contains("--query"));
-    assert!(text.contains("--since"));
-    assert!(text.contains("--cwd"));
-    assert!(text.contains("--provider"));
-    assert!(text.contains("--source"));
-    assert!(text.contains("--sort"));
-    assert!(!text.contains("--json"));
-}
-
-#[test]
-fn tui_requires_interactive_terminal_before_connecting() {
-    Command::cargo_bin("codex-threads")
-        .expect("binary")
-        .args(["--connect", "unix:///tmp/missing.sock", "tui"])
-        .assert()
-        .code(2)
-        .stderr(predicates::str::contains(
-            "tui requires an interactive terminal",
-        ));
 }
 
 #[test]
@@ -3020,6 +3250,568 @@ fn send_falls_back_to_polling_when_turn_notifications_are_absent() {
 }
 
 #[test]
+fn wait_attaches_to_an_existing_turn_and_returns_its_terminal_result() {
+    let server = MockServer::start_without_turn_notifications();
+    let completed = run_json(
+        &server,
+        &[
+            "wait",
+            "--server",
+            "work",
+            "--json",
+            "--timeout",
+            "10",
+            "thread_1",
+            "turn_1",
+        ],
+    );
+
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["threadId"], "thread_1");
+    assert_eq!(completed["turnId"], "turn_1");
+    assert_eq!(completed["finalAssistantText"], "done");
+    assert!(server.methods().contains(&"thread/resume".to_string()));
+    assert!(!server.methods().contains(&"thread/turns/list".to_string()));
+    assert_eq!(
+        completed["progress"].as_array().unwrap().last().unwrap()["source"],
+        "snapshot"
+    );
+    let snapshot = completed["progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "assistantMessage")
+        .expect("retained snapshot assistant event");
+    assert_eq!(snapshot["source"], "snapshot");
+    assert_eq!(snapshot["text"], "done");
+}
+
+#[test]
+fn wait_completes_from_the_resume_snapshot_without_waiting_for_the_quiet_poll() {
+    let server = MockServer::start_without_turn_notifications();
+    let output = server
+        .command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "300")
+        .args([
+            "wait",
+            "--server",
+            "work",
+            "--json",
+            "--timeout",
+            "1",
+            "thread_1",
+            "turn_1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let completed: Value = serde_json::from_slice(&output).expect("terminal json");
+
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(
+        completed["progress"].as_array().unwrap().last().unwrap()["source"],
+        "snapshot"
+    );
+    assert!(!server.methods().contains(&"thread/turns/list".to_string()));
+}
+
+#[test]
+fn wait_timeout_covers_the_initial_resume_request() {
+    let server = MockServer::start_without_turn_notifications();
+    let started = std::time::Instant::now();
+    server
+        .command()
+        .args([
+            "wait",
+            "--server",
+            "work",
+            "--timeout",
+            "1",
+            "thread_hung_resume",
+            "turn_1",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "timed out waiting for turn `turn_1`",
+        ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
+
+#[test]
+fn wait_timeout_cancels_a_hung_fallback_poll() {
+    let server = MockServer::start_without_turn_notifications();
+    let started = std::time::Instant::now();
+    server
+        .command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "1")
+        .args([
+            "wait",
+            "--server",
+            "work",
+            "--timeout",
+            "2",
+            "thread_hung_poll",
+            "turn_1",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "timed out waiting for turn `turn_1`",
+        ));
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn wait_and_events_follow_report_local_interrupts_while_a_poll_is_hung() {
+    let server = MockServer::start_without_turn_notifications();
+    for args in [
+        vec![
+            "wait",
+            "--server",
+            "work",
+            "--timeout",
+            "60",
+            "thread_hung_poll",
+            "turn_1",
+        ],
+        vec![
+            "events",
+            "follow",
+            "--server",
+            "work",
+            "--timeout",
+            "60",
+            "thread_hung_poll",
+            "turn_1",
+        ],
+    ] {
+        let output = run_and_interrupt(&server, &args);
+        assert_eq!(output.status.code(), Some(130));
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(stderr.contains("interrupted locally; turn is still running"));
+        assert!(stderr.contains("threadId"));
+        assert!(stderr.contains("thread_hung_poll"));
+        assert!(stderr.contains("turnId"));
+        assert!(stderr.contains("turn_1"));
+    }
+}
+
+#[test]
+fn wait_reports_local_interrupt_while_resume_is_hung() {
+    let server = MockServer::start_without_turn_notifications();
+    let output = run_and_interrupt(
+        &server,
+        &[
+            "wait",
+            "--server",
+            "work",
+            "--timeout",
+            "60",
+            "thread_hung_resume",
+            "turn_1",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(130));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("interrupted locally; turn is still running"));
+    assert!(stderr.contains("thread_hung_resume"));
+    assert!(stderr.contains("turn_1"));
+}
+
+#[test]
+fn result_reads_a_persisted_turn_without_starting_or_resuming_it() {
+    let server = MockServer::start();
+    let result = run_json(
+        &server,
+        &["result", "--server", "work", "--json", "thread_1", "turn_1"],
+    );
+
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["threadId"], "thread_1");
+    assert_eq!(result["turnId"], "turn_1");
+    assert_eq!(result["finalAssistantText"], "done");
+    assert_eq!(result["turn"]["experimentalTurnField"], "retained");
+    assert_eq!(
+        server.methods(),
+        vec!["initialize", "initialized", "thread/turns/list"]
+    );
+}
+
+#[test]
+fn result_pages_until_it_finds_a_turn_beyond_the_server_page_cap() {
+    let server = MockServer::start();
+    let result = run_json(
+        &server,
+        &[
+            "result",
+            "--server",
+            "work",
+            "--json",
+            "thread_result_paged",
+            "turn_target_101",
+        ],
+    );
+
+    assert_eq!(result["turnId"], "turn_target_101");
+    assert_eq!(result["finalAssistantText"], "done");
+    let params = server.params_for("thread/turns/list");
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0]["limit"], 100);
+    assert!(params[0]["cursor"].is_null());
+    assert_eq!(params[1]["limit"], 100);
+    assert_eq!(params[1]["cursor"], "turn-page-2");
+}
+
+#[test]
+fn result_rejects_an_empty_page_that_claims_another_cursor() {
+    let server = MockServer::start();
+    server
+        .command()
+        .args([
+            "result",
+            "--server",
+            "work",
+            "--json",
+            "--max-turns",
+            "1",
+            "thread_result_empty_page",
+            "turn_missing",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "empty turn page with a next cursor",
+        ));
+    assert_eq!(server.params_for("thread/turns/list").len(), 1);
+}
+
+#[test]
+fn result_rejects_missing_or_non_string_turn_status() {
+    let server = MockServer::start();
+    for thread_id in ["thread_missing_status", "thread_invalid_status"] {
+        server
+            .command()
+            .args([
+                "result", "--server", "work", "--json", thread_id, "turn_bad",
+            ])
+            .assert()
+            .code(3)
+            .stderr(predicates::str::contains(
+                "app-server returned a turn without a string status",
+            ));
+    }
+}
+
+#[test]
+fn wait_rejects_a_persisted_turn_without_a_string_status() {
+    let server = MockServer::start_without_turn_notifications();
+    server
+        .command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "1")
+        .args([
+            "wait",
+            "--server",
+            "work",
+            "--timeout",
+            "10",
+            "thread_missing_status",
+            "turn_bad",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "app-server returned a turn without a string status",
+        ));
+}
+
+#[test]
+fn events_follow_emits_ndjson_through_the_terminal_event() {
+    let server = MockServer::start_without_turn_notifications();
+    let events = server
+        .command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "1")
+        .args([
+            "events",
+            "follow",
+            "--server",
+            "work",
+            "--timeout",
+            "10",
+            "thread_1",
+            "turn_1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = String::from_utf8(events)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("ndjson"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(events.first().unwrap()["type"], "attached");
+    assert!(events.first().unwrap().get("thread").is_none());
+    assert_eq!(events.last().unwrap()["type"], "completed");
+    let snapshot = events
+        .iter()
+        .find(|event| event["type"] == "assistantMessage")
+        .expect("snapshot assistant message");
+    assert_eq!(snapshot["source"], "snapshot");
+    assert_eq!(snapshot["text"], "done");
+    assert_eq!(events.last().unwrap()["source"], "snapshot");
+    assert!(!server.methods().contains(&"thread/turns/list".to_string()));
+}
+
+#[test]
+fn attachment_does_not_duplicate_snapshot_content_under_a_live_item_id() {
+    let server = MockServer::start_without_turn_notifications();
+    let output = run_json(
+        &server,
+        &[
+            "wait",
+            "--server",
+            "work",
+            "--json",
+            "thread_snapshot_replay",
+            "turn_1",
+        ],
+    );
+    assert_eq!(output["finalAssistantText"], "done");
+    assert_eq!(output["assistantResponses"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn terminal_notification_received_before_an_unmaterialized_error_is_not_lost() {
+    let server = MockServer::start_without_turn_notifications();
+    let output = run_json(
+        &server,
+        &[
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "thread_unmaterialized_terminal",
+            "continue",
+        ],
+    );
+    assert_eq!(output["status"], "completed");
+}
+
+#[test]
+fn wait_rejects_turn_history_without_a_data_array() {
+    let server = MockServer::start_without_turn_notifications();
+    server
+        .command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "1")
+        .args([
+            "wait",
+            "--server",
+            "work",
+            "--timeout",
+            "5",
+            "thread_missing_turn_data",
+            "turn_1",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/turns/list response missing data array",
+        ));
+}
+
+#[test]
+fn inject_forwards_validated_raw_response_items_without_starting_a_turn() {
+    let server = MockServer::start();
+    let output = run_json(
+        &server,
+        &[
+            "inject",
+            "--server",
+            "work",
+            "--json",
+            "--items-json",
+            r#"[{"type":"message","role":"user","content":[{"type":"input_text","text":"remember this"}]}]"#,
+            "thread_1",
+        ],
+    );
+
+    assert_eq!(output["status"], "accepted");
+    assert_eq!(output["itemCount"], 1);
+    let params = server.params_for("thread/inject_items");
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0]["threadId"], "thread_1");
+    assert_eq!(params[0]["items"][0]["role"], "user");
+    assert!(!server.methods().contains(&"turn/start".to_string()));
+}
+
+#[test]
+fn inject_rejects_a_non_object_success_result() {
+    let server = MockServer::start();
+    server
+        .command()
+        .args([
+            "inject",
+            "--server",
+            "work",
+            "--json",
+            "--items-json",
+            r#"[{"type":"message","role":"user","content":[]}]"#,
+            "thread_invalid_inject_result",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/inject_items response must be an object",
+        ));
+}
+
+#[test]
+fn inject_reads_items_from_stdin_when_items_file_is_dash() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args([
+            "inject",
+            "--server",
+            "work",
+            "--json",
+            "--items-file",
+            "-",
+            "thread_1",
+        ])
+        .write_stdin(r#"[{"type":"message","role":"assistant","content":[]}]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: Value = serde_json::from_slice(&output).expect("json output");
+
+    assert_eq!(output["itemCount"], 1);
+    assert_eq!(
+        server.params_for("thread/inject_items")[0]["items"][0]["role"],
+        "assistant"
+    );
+}
+
+#[test]
+fn inject_rejects_non_array_and_empty_items_before_rpc_submission() {
+    let server = MockServer::start();
+    server
+        .command()
+        .args([
+            "inject",
+            "--server",
+            "work",
+            "--items-json",
+            r#"{"type":"message"}"#,
+            "thread_1",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("must be a non-empty JSON array"));
+    server
+        .command()
+        .args([
+            "inject",
+            "--server",
+            "work",
+            "--items-json",
+            "[]",
+            "thread_1",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("must be a non-empty JSON array"));
+
+    assert!(server.params_for("thread/inject_items").is_empty());
+}
+
+#[test]
+fn inject_rejects_oversized_files_before_rpc_submission() {
+    let server = MockServer::start();
+    let temp = TempDir::new().expect("tempdir");
+    let items = temp.path().join("oversized-items.json");
+    fs::write(&items, vec![b' '; 16 * 1024 * 1024 + 1]).expect("write oversized input");
+
+    server
+        .command()
+        .args([
+            "inject",
+            "--server",
+            "work",
+            "--items-file",
+            items.to_str().expect("utf8 path"),
+            "thread_1",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("16777216-byte limit"));
+
+    assert!(server.params_for("thread/inject_items").is_empty());
+}
+
+#[test]
+fn send_retries_when_turn_history_is_not_materialized_yet() {
+    let server = MockServer::start_with_unmaterialized_first_poll();
+    let output = server
+        .command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "1")
+        .args(["send", "--server", "work", "--json", "thread_1", "continue"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let completed: Value = serde_json::from_slice(&output).expect("json output");
+
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["finalAssistantText"], "done");
+    assert!(
+        server
+            .methods()
+            .iter()
+            .filter(|method| method.as_str() == "thread/turns/list")
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn send_propagates_other_invalid_turn_history_errors() {
+    let server = MockServer::start_rejecting_first_turns_list_with(
+        -32600,
+        "thread/turns/list rejected the requested items view",
+    );
+    server
+        .command()
+        .env("CODEX_TAMER_TURN_POLL_QUIET_SECS", "1")
+        .args([
+            "send", "--server", "work", "--json", "thread_1", "continue",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "app-server `thread/turns/list` error -32600: thread/turns/list rejected the requested items view",
+        ));
+
+    assert_eq!(
+        server
+            .methods()
+            .iter()
+            .filter(|method| method.as_str() == "thread/turns/list")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn send_resumes_not_loaded_thread_before_retrying_turn_start() {
     let server = MockServer::start_requiring_resume_for_send();
     let accepted = run_json(
@@ -3282,6 +4074,11 @@ fn failed_turn_exits_one_and_returns_terminal_json() {
     assert_eq!(failed["turnId"], "turn_1");
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["finalAssistantText"], "failed");
+    assert_eq!(failed["error"]["code"], "mock_failure");
+    assert_eq!(
+        failed["progress"].as_array().unwrap().last().unwrap()["error"]["message"],
+        "mock turn failed"
+    );
 }
 
 #[test]
@@ -3319,6 +4116,248 @@ fn malformed_app_server_turn_start_is_exit_code_three() {
 }
 
 #[test]
+fn malformed_control_acknowledgements_are_exit_code_three() {
+    let server = MockServer::start();
+
+    server
+        .command()
+        .args([
+            "steer",
+            "--server",
+            "work",
+            "--json",
+            "thread_invalid_steer_result",
+            "turn_1",
+            "adjust",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "turn/steer response missing turnId",
+        ));
+
+    server
+        .command()
+        .args([
+            "interrupt",
+            "--server",
+            "work",
+            "--json",
+            "thread_invalid_interrupt_result",
+            "turn_1",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "turn/interrupt response must be an object",
+        ));
+}
+
+#[test]
+fn mutation_commands_reject_non_object_app_server_results() {
+    let cases = [
+        (
+            "thread/settings/update",
+            vec![
+                "settings", "set", "--server", "work", "thread_1", "--effort", "high",
+            ],
+        ),
+        (
+            "thread/name/set",
+            vec!["name", "--server", "work", "thread_1", "New name"],
+        ),
+        (
+            "thread/archive",
+            vec!["archive", "--server", "work", "thread_1"],
+        ),
+        (
+            "thread/unarchive",
+            vec!["unarchive", "--server", "work", "thread_1"],
+        ),
+        (
+            "thread/metadata/update",
+            vec!["pin", "--server", "work", "thread_1"],
+        ),
+        (
+            "thread/goal/set",
+            vec![
+                "goal",
+                "set",
+                "--server",
+                "work",
+                "thread_1",
+                "--objective",
+                "Ship",
+            ],
+        ),
+        (
+            "thread/goal/clear",
+            vec!["goal", "clear", "--server", "work", "thread_1"],
+        ),
+    ];
+
+    for (method, args) in cases {
+        let server = MockServer::start_with_response(method, Value::Null);
+        server
+            .command()
+            .args(args)
+            .assert()
+            .code(3)
+            .stderr(predicates::str::contains(format!(
+                "{method} response must be an object"
+            )));
+    }
+}
+
+#[test]
+fn thread_mutations_reject_mismatched_acknowledgements() {
+    let server = MockServer::start_with_response(
+        "thread/metadata/update",
+        json!({"thread": sample_pinned_thread("thread_other")}),
+    );
+    server
+        .command()
+        .args(["pin", "--server", "work", "thread_1"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/metadata/update response thread.id `thread_other` does not match `thread_1`",
+        ));
+
+    let server = MockServer::start_with_response(
+        "thread/metadata/update",
+        json!({"thread": sample_pinned_thread("thread_1")}),
+    );
+    server
+        .command()
+        .args(["unpin", "--server", "work", "thread_1"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/metadata/update response thread.isPinned does not match false",
+        ));
+
+    let server = MockServer::start_with_response(
+        "thread/unarchive",
+        json!({"thread": sample_thread("thread_other")}),
+    );
+    server
+        .command()
+        .args(["unarchive", "--server", "work", "thread_1"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/unarchive response thread.id `thread_other` does not match `thread_1`",
+        ));
+}
+
+#[test]
+fn goal_mutations_reject_malformed_or_mismatched_acknowledgements() {
+    let server = MockServer::start_with_response(
+        "thread/goal/set",
+        json!({
+            "goal": {
+                "threadId": "thread_other",
+                "objective": "Ship",
+                "status": "active",
+                "tokenBudget": 1000,
+                "tokensUsed": 0,
+                "timeUsedSeconds": 0,
+                "createdAt": 1,
+                "updatedAt": 1
+            }
+        }),
+    );
+    server
+        .command()
+        .args([
+            "goal",
+            "set",
+            "--server",
+            "work",
+            "thread_1",
+            "--objective",
+            "Ship",
+            "--token-budget",
+            "1000",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/goal/set response goal.threadId `thread_other` does not match `thread_1`",
+        ));
+
+    let server = MockServer::start_with_response("thread/goal/clear", json!({"cleared": "yes"}));
+    server
+        .command()
+        .args(["goal", "clear", "--server", "work", "thread_1"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/goal/clear response cleared must be a boolean",
+        ));
+}
+
+#[test]
+fn usage_redeem_rejects_unknown_consume_outcomes() {
+    let server = MockServer::start_with_response(
+        "account/rateLimitResetCredit/consume",
+        json!({"outcome": "maybe"}),
+    );
+    server.allow_rate_limit_reset();
+
+    server
+        .command()
+        .args(["usage", "redeem", "--server", "work", "--json"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "account/rateLimitResetCredit/consume response has unknown outcome `maybe`",
+        ));
+}
+
+#[test]
+fn steer_rejects_an_acknowledgement_for_a_different_turn() {
+    let server = MockServer::start();
+
+    server
+        .command()
+        .args([
+            "steer",
+            "--server",
+            "work",
+            "--json",
+            "thread_mismatched_steer_result",
+            "turn_1",
+            "adjust",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains("turn/steer response"));
+}
+
+#[test]
+fn result_rejects_non_string_next_cursor() {
+    let server = MockServer::start();
+
+    server
+        .command()
+        .args([
+            "result",
+            "--server",
+            "work",
+            "--json",
+            "thread_invalid_next_cursor",
+            "turn_missing",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "thread/turns/list response nextCursor must be a string or null",
+        ));
+}
+
+#[test]
 fn control_and_goal_commands_return_acknowledgements() {
     let server = MockServer::start();
 
@@ -3328,8 +4367,13 @@ fn control_and_goal_commands_return_acknowledgements() {
             &[
                 "steer", "--server", "work", "--json", "thread_1", "turn_1", "adjust"
             ]
-        )["status"],
-        "accepted"
+        ),
+        json!({
+            "server": "work",
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "status": "accepted"
+        })
     );
     assert_eq!(
         run_json(
@@ -3342,8 +4386,13 @@ fn control_and_goal_commands_return_acknowledgements() {
                 "thread_1",
                 "turn_1"
             ]
-        )["status"],
-        "accepted"
+        ),
+        json!({
+            "server": "work",
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "status": "accepted"
+        })
     );
     assert_eq!(
         run_json(

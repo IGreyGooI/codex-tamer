@@ -358,11 +358,7 @@ pub fn home_dir() -> PathBuf {
 
 pub fn resolve_config_path(flag: Option<PathBuf>) -> PathBuf {
     let home = home_dir();
-    resolve_config_path_from(
-        flag,
-        env::var("CODEX_THREADS_CONFIG").ok().as_deref(),
-        &home,
-    )
+    resolve_config_path_from(flag, env::var("CODEX_TAMER_CONFIG").ok().as_deref(), &home)
 }
 
 pub fn resolve_config_path_from(
@@ -376,30 +372,15 @@ pub fn resolve_config_path_from(
     if let Some(path) = env_value {
         return PathBuf::from(path);
     }
-    home.join(".config/codex-threads/config.toml")
+    home.join(".config/codex-tamer/config.toml")
 }
 
 pub fn resolve_target(config: &AppConfig, server_flag: Option<&str>) -> Result<Target> {
     resolve_target_from(
         config,
         server_flag,
-        env::var("CODEX_THREADS_SERVER").ok().as_deref(),
+        env::var("CODEX_TAMER_SERVER").ok().as_deref(),
     )
-}
-
-#[cfg(feature = "tui")]
-pub fn resolve_tui_targets(config: &AppConfig, server_flag: Option<&str>) -> Result<Vec<Target>> {
-    if server_flag.is_some() || env::var("CODEX_THREADS_SERVER").is_ok() {
-        return Ok(vec![resolve_target(config, server_flag)?]);
-    }
-    if config.servers.is_empty() {
-        return Err(anyhow!("no servers configured"));
-    }
-    config
-        .servers
-        .iter()
-        .map(|(alias, server)| Target::configured(alias, server, config))
-        .collect()
 }
 
 pub fn resolve_target_from(
@@ -425,7 +406,7 @@ pub fn resolve_target_from(
     }
 
     Err(anyhow!(
-        "multiple servers configured; pass --server ALIAS or set CODEX_THREADS_SERVER"
+        "multiple servers configured; pass --server ALIAS or set CODEX_TAMER_SERVER"
     ))
 }
 

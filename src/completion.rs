@@ -30,9 +30,9 @@ pub fn normalize_shell(shell: Option<CompletionShell>) -> Result<CompletionShell
 pub fn completion_instructions(shell: CompletionShell) -> String {
     let shell_name = shell_name(shell);
     let current_shell_command = match shell {
-        CompletionShell::Fish => "codex-threads completion script fish | source".to_string(),
+        CompletionShell::Fish => "codex-tamer completion script fish | source".to_string(),
         CompletionShell::Bash | CompletionShell::Zsh => {
-            format!("source <(codex-threads completion script {shell_name})")
+            format!("source <(codex-tamer completion script {shell_name})")
         }
     };
     [
@@ -51,7 +51,7 @@ pub fn completion_instructions(shell: CompletionShell) -> String {
     )
     .chain([
         String::new(),
-        "Regenerate that file after upgrading codex-threads.".to_string(),
+        "Regenerate that file after upgrading codex-tamer.".to_string(),
         String::new(),
     ])
     .collect::<Vec<_>>()
@@ -326,48 +326,48 @@ fn shell_name(shell: CompletionShell) -> &'static str {
 fn permanent_completion_commands(shell: CompletionShell) -> Vec<&'static str> {
     match shell {
         CompletionShell::Bash => vec![
-            "mkdir -p ~/.local/share/codex-threads",
-            "codex-threads completion script bash > ~/.local/share/codex-threads/completion.bash",
-            "printf '\\nsource ~/.local/share/codex-threads/completion.bash\\n' >> ~/.bashrc",
+            "mkdir -p ~/.local/share/codex-tamer",
+            "codex-tamer completion script bash > ~/.local/share/codex-tamer/completion.bash",
+            "printf '\\nsource ~/.local/share/codex-tamer/completion.bash\\n' >> ~/.bashrc",
         ],
         CompletionShell::Zsh => vec![
-            "mkdir -p ~/.local/share/codex-threads",
-            "codex-threads completion script zsh > ~/.local/share/codex-threads/completion.zsh",
-            "printf '\\nsource ~/.local/share/codex-threads/completion.zsh\\n' >> ~/.zshrc",
+            "mkdir -p ~/.local/share/codex-tamer",
+            "codex-tamer completion script zsh > ~/.local/share/codex-tamer/completion.zsh",
+            "printf '\\nsource ~/.local/share/codex-tamer/completion.zsh\\n' >> ~/.zshrc",
         ],
         CompletionShell::Fish => vec![
             "mkdir -p ~/.config/fish/completions",
-            "codex-threads completion script fish > ~/.config/fish/completions/codex-threads.fish",
+            "codex-tamer completion script fish > ~/.config/fish/completions/codex-tamer.fish",
         ],
     }
 }
 
 fn bash_completion_script() -> String {
-    r#"_codex_threads_completion() {
+    r#"_codex_tamer_completion() {
   local cur
   local -a words
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   words=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
-  mapfile -t COMPREPLY < <(codex-threads __complete -- "$cur" "${words[@]}" 2>/dev/null)
+  mapfile -t COMPREPLY < <(codex-tamer __complete -- "$cur" "${words[@]}" 2>/dev/null)
 }
 
-complete -o bashdefault -o default -F _codex_threads_completion codex-threads
+complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer
 "#
     .to_string()
 }
 
 fn zsh_completion_script() -> String {
-    r#"#compdef codex-threads
+    r#"#compdef codex-tamer
 
-_codex_threads() {
+_codex_tamer() {
   local current="${words[CURRENT]}"
   local -a prior=()
   if (( CURRENT > 2 )); then
     prior=("${words[2,$(( CURRENT - 1 ))]}")
   fi
   local -a names
-  names=("${(@f)$(codex-threads __complete -- "$current" "${prior[@]}" 2>/dev/null)}")
+  names=("${(@f)$(codex-tamer __complete -- "$current" "${prior[@]}" 2>/dev/null)}")
   if (( ${#names[@]} )); then
     compadd -a names
   else
@@ -375,13 +375,13 @@ _codex_threads() {
   fi
 }
 
-compdef _codex_threads codex-threads
+compdef _codex_tamer codex-tamer
 "#
     .to_string()
 }
 
 fn fish_completion_script() -> String {
-    r#"function __codex_threads_complete
+    r#"function __codex_tamer_complete
   set -l current (commandline -ct)
   set -l words (commandline -opc)
   if test (count $words) -gt 0
@@ -390,10 +390,10 @@ fn fish_completion_script() -> String {
   if test (count $words) -gt 0; and test "$words[-1]" = "$current"
     set -e words[-1]
   end
-  codex-threads __complete -- "$current" $words 2>/dev/null
+  codex-tamer __complete -- "$current" $words 2>/dev/null
 end
 
-complete -c codex-threads -a '(__codex_threads_complete)'
+complete -c codex-tamer -a '(__codex_tamer_complete)'
 "#
     .to_string()
 }

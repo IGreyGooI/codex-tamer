@@ -147,7 +147,7 @@ test("builds a platform bundle containing the native CLI and unchanged skill", (
 			installer: "install.mjs",
 			name: "codex-tamer",
 			skill: "skills/codex-tamer",
-			target: "linux-x86_64",
+			target,
 			version: "1.2.3",
 		});
 	});

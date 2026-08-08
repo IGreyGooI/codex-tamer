@@ -76,7 +76,8 @@ _No unreleased changes._
   symbol version.
 - Keep release checks portable across Windows LF checkout, executable-bit,
   drive-path, and archive behaviors, and canonicalize macOS temporary paths in
-  managed `CODEX_HOME` identity tests.
+  managed `CODEX_HOME` identity tests. Validate packaged manifests against the
+  actual native target on every supported architecture.
 - Update `anyhow` to `1.0.104` to address `RUSTSEC-2026-0190`, an unsound
   `Error::downcast_mut()` implementation in versions before `1.0.103`.
 - Make `servers status` reserve successful `stopped` output for an absent

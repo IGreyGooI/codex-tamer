@@ -1,6 +1,6 @@
 [package]
 name = "codex-tamer"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Headless Agent-facing CLI for querying and controlling Codex app-server threads"

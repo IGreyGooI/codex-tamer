@@ -2498,7 +2498,7 @@ path = "/tmp/personal.sock"
         .success()
         .stdout(predicates::str::contains("Detected shell: bash"))
         .stdout(predicates::str::contains(
-            "source <(codex-tamer completion script bash)",
+            "source /dev/stdin <<< \"$(codex-tamer completion script bash)\"",
         ));
 
     Command::cargo_bin("codex-tamer")
@@ -2511,8 +2511,9 @@ path = "/tmp/personal.sock"
             "COMPREPLY[${#COMPREPLY[@]}]=\"$candidate\"",
         ))
         .stdout(predicates::str::contains(
-            "done <<< \"$(codex-tamer __complete",
+            "output=\"$(command codex-tamer __complete",
         ))
+        .stdout(predicates::str::contains("done <<< \"$output\""))
         .stdout(predicates::str::contains(
             "complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer",
         ))
@@ -2600,7 +2601,7 @@ path = "/tmp/personal.sock"
             .collect::<Vec<_>>()
             .join(" ");
         let script = format!(
-            "source <(codex-tamer completion script bash); \
+            "source /dev/stdin <<< \"$(codex-tamer completion script bash)\"; \
              COMP_WORDS=({words}); \
              COMP_CWORD={cword}; \
              _codex_tamer_completion; \

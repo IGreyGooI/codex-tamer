@@ -31,9 +31,10 @@ pub fn completion_instructions(shell: CompletionShell) -> String {
     let shell_name = shell_name(shell);
     let current_shell_command = match shell {
         CompletionShell::Fish => "codex-tamer completion script fish | source".to_string(),
-        CompletionShell::Bash | CompletionShell::Zsh => {
-            format!("source <(codex-tamer completion script {shell_name})")
+        CompletionShell::Bash => {
+            "source /dev/stdin <<< \"$(codex-tamer completion script bash)\"".to_string()
         }
+        CompletionShell::Zsh => format!("source <(codex-tamer completion script {shell_name})"),
     };
     [
         format!("Detected shell: {shell_name}"),
@@ -346,15 +347,17 @@ fn bash_completion_script() -> String {
     r#"_codex_tamer_completion() {
   local cur
   local candidate
+  local output
   local -a words
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   words=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
+  output="$(command codex-tamer __complete -- "$cur" "${words[@]}" 2>/dev/null)" || return
   while IFS= read -r candidate; do
     if [[ -n "$candidate" ]]; then
       COMPREPLY[${#COMPREPLY[@]}]="$candidate"
     fi
-  done <<< "$(codex-tamer __complete -- "$cur" "${words[@]}" 2>/dev/null)"
+  done <<< "$output"
 }
 
 complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer

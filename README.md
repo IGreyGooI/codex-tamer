@@ -590,7 +590,7 @@ annotations whose threads app-server reports missing.
 
 ```bash
 codex-tamer completion
-source <(codex-tamer completion script bash)
+source /dev/stdin <<< "$(codex-tamer completion script bash)"
 source <(codex-tamer completion script zsh)
 codex-tamer completion script fish | source
 ```

@@ -39,6 +39,7 @@ function createRepositoryFixture(root) {
 		'[package]\nname = "codex-tamer"\nversion = "1.2.3"\n',
 	);
 	writeFileSync(join(root, "LICENSE"), "MIT\n");
+	writeFileSync(join(root, "README.md"), "# Install\n\nRun `node install.mjs --json`.\n");
 	writeFileSync(join(root, "scripts", "install-bundle.mjs"), "// installer\n");
 	writeFileSync(
 		join(root, "skills", "codex-tamer", "SKILL.md"),
@@ -142,6 +143,10 @@ test("builds a platform bundle containing the native CLI and unchanged skill", (
 		);
 		assert.equal(readFileSync(join(result.bundlePath, "install.mjs"), "utf8"), "// installer\n");
 		assert.equal(readFileSync(join(result.bundlePath, "LICENSE"), "utf8"), "MIT\n");
+		assert.equal(
+			readFileSync(join(result.bundlePath, "README.md"), "utf8"),
+			"# Install\n\nRun `node install.mjs --json`.\n",
+		);
 		assert.deepEqual(JSON.parse(readFileSync(join(result.bundlePath, "manifest.json"), "utf8")), {
 			binary: `bin/${binaryName}`,
 			installer: "install.mjs",
@@ -238,6 +243,7 @@ test("archives a Linux bundle and writes its SHA256", () => {
 		assert.equal(listed.status, 0, listed.stderr);
 		const entries = listed.stdout.split(/\r?\n/);
 		assert.ok(entries.includes(`${bundle.bundleName}/manifest.json`));
+		assert.ok(entries.includes(`${bundle.bundleName}/README.md`));
 		assert.ok(entries.includes(`${bundle.bundleName}/skills/codex-tamer/SKILL.md`));
 	});
 });

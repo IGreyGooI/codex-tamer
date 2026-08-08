@@ -228,10 +228,10 @@ jobs:
           release_notes="${RUNNER_TEMP}/codex-tamer-release-notes.md"
           node --input-type=module - "$version" "$release_notes" <<'NODE'
           import { readFileSync, writeFileSync } from "node:fs";
-          import { releaseNotesFromChangelog } from "./scripts/release.mjs";
+          import { publicReleaseNotes } from "./scripts/release.mjs";
 
           const [version, notesPath] = process.argv.slice(2);
-          const notes = releaseNotesFromChangelog(readFileSync("CHANGELOG.md", "utf8"), version);
+          const notes = publicReleaseNotes(readFileSync("CHANGELOG.md", "utf8"), version);
           writeFileSync(notesPath, `${notes}\n`);
           NODE
 

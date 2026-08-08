@@ -4,9 +4,11 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+	publicReleaseNotes,
 	releaseNotesFromChangelog,
 	releasePreflightCommands,
 	releaseRemoteFromEnvironment,
+	updateReadmeInstallVersion,
 	validateReleaseRemoteUrls,
 	validateReleasePushUrl,
 } from "./release.mjs";
@@ -67,6 +69,8 @@ test("tag workflow builds, verifies, and uploads every supported platform bundle
 	assert.match(workflow, /openssl_symbol_floor="OPENSSL_3\.0\.0"/);
 	assert.match(workflow, /requires unsupported OpenSSL symbol versions/);
 	assert.match(workflow, /readFileSync\("CHANGELOG\.md"/);
+	assert.match(workflow, /import \{ publicReleaseNotes \} from "\.\/scripts\/release\.mjs"/);
+	assert.match(workflow, /const notes = publicReleaseNotes\(/);
 	assert.match(workflow, /--notes-file "\$release_notes"/);
 	assert.match(workflow, /Verify tag provenance/);
 	assert.match(
@@ -170,6 +174,50 @@ test("extracts curated notes from the exact tagged changelog section", () => {
 	assert.throws(
 		() => releaseNotesFromChangelog("## [1.2.3]\n\n## [1.2.2]\nnotes\n", "1.2.3"),
 		/release section for 1\.2\.3 is empty/i,
+	);
+	const publicNotes = publicReleaseNotes(changelog, "1.2.3");
+	assert.match(publicNotes, /## Install/);
+	assert.match(publicNotes, /Node\.js 20\+/);
+	assert.match(publicNotes, /node install\.mjs --json/);
+	assert.match(publicNotes, /blob\/v1\.2\.3\/README\.md#install/);
+	assert.match(publicNotes, /## Changes[\s\S]*Agent-first release bundles\./);
+});
+
+test("updates the public install example to the release version", () => {
+	const readme = [
+		"# Install",
+		"",
+		"```bash",
+		"VERSION=1.2.2",
+		'ASSET="codex-tamer-${VERSION}-linux-x86_64.tar.gz"',
+		"```",
+		"",
+	].join("\n");
+	assert.equal(
+		updateReadmeInstallVersion(readme, "1.2.3"),
+		readme.replace("VERSION=1.2.2", "VERSION=1.2.3"),
+	);
+	assert.throws(
+		() => updateReadmeInstallVersion("# Install\n", "1.2.3"),
+		/exactly one public install version/i,
+	);
+	assert.throws(
+		() => updateReadmeInstallVersion(`${readme}${readme}`, "1.2.3"),
+		/exactly one public install version/i,
+	);
+	assert.throws(
+		() => updateReadmeInstallVersion(readme, "next"),
+		/stable semantic version/i,
+	);
+
+	const releaseScript = readFileSync(join(root, "scripts", "release.mjs"), "utf8");
+	assert.match(
+		releaseScript,
+		/const updatedReadme = prepareReadmeForRelease\(version\);[\s\S]*?updateCargoTomlVersion\(version\);[\s\S]*?writeFileSync\(readmePath, updatedReadme, "utf-8"\);[\s\S]*?runReleasePreflight\(\);/,
+	);
+	assert.match(
+		releaseScript,
+		/const releaseCommitPaths = \["Cargo\.toml", "CHANGELOG\.md", "README\.md"\];/,
 	);
 });
 

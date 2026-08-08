@@ -21,7 +21,7 @@ use crate::codex_runtime::SUPPORTED_CODEX_VERSION;
 #[cfg(unix)]
 use crate::codex_runtime::resolve_codex_runtime;
 use crate::config::{AppConfig, Endpoint, resolve_codex_home};
-use crate::rpc::{InitializeInfo, PeerIdentity, RpcClient};
+use crate::rpc::{CLIENT_NAME, InitializeInfo, PeerIdentity, RpcClient};
 
 const START_LOCK_FILE: &str = "start.lock";
 const PROCESS_FILE: &str = "process.json";
@@ -131,6 +131,7 @@ pub async fn connect_or_start(
         command
             .args(["app-server", "--listen", endpoint.display().as_str()])
             .env("CODEX_HOME", &runtime.codex_home)
+            .env_remove("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
@@ -894,9 +895,9 @@ fn server_version_from_user_agent(user_agent: &str) -> Result<&str> {
     let (name, version) = product
         .rsplit_once('/')
         .ok_or_else(|| anyhow!("app-server userAgent `{user_agent}` has no version"))?;
-    if name != "codex_cli_rs" {
+    if name != CLIENT_NAME {
         bail!(
-            "app-server product `{name}` is incompatible; expected reviewed Codex product `codex_cli_rs`"
+            "app-server product `{name}` is incompatible; expected managed client product `{CLIENT_NAME}`"
         );
     }
     if version != SUPPORTED_CODEX_VERSION {
@@ -1027,20 +1028,23 @@ mod tests {
     #[test]
     fn managed_identity_requires_the_selected_home_and_reviewed_server_version() {
         validate_managed_identity(
-            &info("/tmp/codex-a", "codex_cli_rs/0.146.0 (Linux; x86_64)"),
+            &info(
+                "/tmp/codex-a",
+                "codex-tamer/0.146.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tamer; 0.3.1)",
+            ),
             Path::new("/tmp/codex-a"),
         )
         .unwrap();
 
         let wrong_home = validate_managed_identity(
-            &info("/tmp/codex-b", "codex_cli_rs/0.146.0 (Linux; x86_64)"),
+            &info("/tmp/codex-b", "codex-tamer/0.146.0 (Linux; x86_64)"),
             Path::new("/tmp/codex-a"),
         )
         .unwrap_err();
         assert!(wrong_home.to_string().contains("/tmp/codex-b"));
 
         let wrong_version = validate_managed_identity(
-            &info("/tmp/codex-a", "codex_cli_rs/0.147.0 (Linux; x86_64)"),
+            &info("/tmp/codex-a", "codex-tamer/0.147.0 (Linux; x86_64)"),
             Path::new("/tmp/codex-a"),
         )
         .unwrap_err();
@@ -1050,11 +1054,12 @@ mod tests {
     #[test]
     fn app_server_user_agent_version_must_be_structured() {
         assert_eq!(
-            server_version_from_user_agent("codex_cli_rs/0.146.0 (Linux; x86_64)").unwrap(),
+            server_version_from_user_agent("codex-tamer/0.146.0 (Linux; x86_64)").unwrap(),
             "0.146.0"
         );
         assert!(server_version_from_user_agent("mock-codex").is_err());
-        assert!(server_version_from_user_agent("codex-tamer/0.146.0").is_err());
+        assert!(server_version_from_user_agent("codex_cli_rs/0.146.0").is_err());
+        assert!(server_version_from_user_agent("codex_vscode/0.146.0").is_err());
         assert!(server_version_from_user_agent("codex/0.146.0-dev").is_err());
     }
 
@@ -1070,7 +1075,7 @@ mod tests {
 
         let error = validate_managed_connection(
             Some(peer),
-            &info("/tmp/codex-a", "codex_cli_rs/0.146.0 (Linux; x86_64)"),
+            &info("/tmp/codex-a", "codex-tamer/0.146.0 (Linux; x86_64)"),
             Path::new("/tmp/codex-a"),
         )
         .unwrap_err();

@@ -34,6 +34,7 @@ const cargoTomlPath = join(ROOT, "Cargo.toml");
 const cargoLockPath = join(ROOT, "Cargo.lock");
 const changelogPath = join(ROOT, "CHANGELOG.md");
 const compatibilityPath = join(ROOT, "CODEX_COMPATIBILITY.md");
+const readmePath = join(ROOT, "README.md");
 
 export function releaseRemoteFromEnvironment(environment = process.env) {
 	const configured = environment.CODEX_TAMER_RELEASE_REMOTE;
@@ -138,6 +139,37 @@ export function releaseNotesFromChangelog(content, version) {
 		throw new Error(`CHANGELOG.md release section for ${version} is empty`);
 	}
 	return notes;
+}
+
+export function publicReleaseNotes(content, version) {
+	const changes = releaseNotesFromChangelog(content, version);
+	return [
+		"## Install",
+		"",
+		"Download the archive for your platform and its adjacent `.sha256` file, verify the checksum, then extract the archive. From the extracted directory run:",
+		"",
+		"```bash",
+		"node install.mjs --json",
+		"```",
+		"",
+		`Node.js 20+ is required. See the [full install instructions](https://github.com/${RELEASE_REPOSITORY}/blob/v${version}/README.md#install).`,
+		"",
+		"## Changes",
+		"",
+		changes,
+	].join("\n");
+}
+
+export function updateReadmeInstallVersion(content, version) {
+	if (typeof content !== "string" || !VERSION_ARG.test(String(version))) {
+		throw new Error("README update requires text and a stable semantic version");
+	}
+	const installVersion = /^VERSION=\d+\.\d+\.\d+$/gm;
+	const matches = content.match(installVersion) ?? [];
+	if (matches.length !== 1) {
+		throw new Error("README.md must contain exactly one public install version");
+	}
+	return content.replace(installVersion, `VERSION=${version}`);
 }
 
 export function releasePreflightCommands(nodeExecutable, testPaths) {
@@ -251,6 +283,16 @@ function updateCargoLockVersion(newVersion) {
 	}
 	content = content.replace(packageRegex, `$1${newVersion}$2`);
 	writeFileSync(cargoLockPath, content, "utf-8");
+}
+
+function prepareReadmeForRelease(newVersion) {
+	const content = readFileSync(readmePath, "utf-8");
+	try {
+		return updateReadmeInstallVersion(content, newVersion);
+	} catch (error) {
+		console.error(`Error: ${error.message}`);
+		process.exit(1);
+	}
 }
 
 function ensureCleanMain() {
@@ -523,17 +565,19 @@ function main(args = process.argv.slice(2), environment = process.env) {
 	ensureTagAvailable(version, releaseRemote);
 	validateChangelogForRelease(version);
 	validateCompatibilityForRelease();
+	const updatedReadme = prepareReadmeForRelease(version);
 
 	if (version !== currentVersion) {
 		updateCargoTomlVersion(version);
 		updateCargoLockVersion(version);
 	}
+	writeFileSync(readmePath, updatedReadme, "utf-8");
 	updateChangelogForRelease(version);
 	const compatibilityUpdated = updateCompatibilityForRelease(compatibilityPath, version);
 
 	runReleasePreflight();
 
-	const releaseCommitPaths = ["Cargo.toml", "CHANGELOG.md"];
+	const releaseCommitPaths = ["Cargo.toml", "CHANGELOG.md", "README.md"];
 	if (existsSync(cargoLockPath)) {
 		releaseCommitPaths.splice(1, 0, "Cargo.lock");
 	}

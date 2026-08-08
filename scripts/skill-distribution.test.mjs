@@ -41,6 +41,7 @@ test("the packaged Skill documents managed shared-listener setup", () => {
 	assert.match(normalized, /status = "stopped"[^.]*confirmed absent listener/i);
 	assert.match(normalized, /incompatible[^.]*malformed[^.]*insecure[^.]*exits `3`/i);
 	assert.match(normalized, /daemon bootstrap[^.]*hourly updater/i);
+	assert.match(normalized, /initialize `userAgent` as `codex-tamer\/0\.146\.0`/i);
 	assert.match(normalized, /On Windows[^.]*automatic Unix startup is unsupported/i);
 	assert.match(normalized, /Require a configured `ws:\/\/` or `wss:\/\/` endpoint/i);
 	assert.match(normalized, /model_reasoning_effort` are defaults/i);

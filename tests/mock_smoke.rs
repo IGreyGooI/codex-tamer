@@ -398,7 +398,7 @@ impl MockServer {
     }
 
     fn start_managed() -> Self {
-        Self::start_managed_with_user_agent("codex_cli_rs/0.146.0 (test)")
+        Self::start_managed_with_user_agent("codex-tamer/0.146.0 (test)")
     }
 
     fn start_managed_with_user_agent(user_agent: &str) -> Self {
@@ -585,7 +585,7 @@ fn managed_listener_process_helper() {
         Arc::new(HashMap::from([(
             "initialize".to_string(),
             json!({
-                "userAgent": "codex_cli_rs/0.146.0 (test)",
+                "userAgent": "codex-tamer/0.146.0 (test)",
                 "codexHome": PathBuf::from(codex_home),
                 "platformFamily": "unix",
                 "platformOs": "linux"
@@ -1747,7 +1747,7 @@ fn managed_status_reports_stopped_only_for_an_absent_listener() {
 fn incompatible_existing_managed_listener_fails_without_invoking_codex() {
     use std::os::unix::fs::PermissionsExt;
 
-    let server = MockServer::start_managed_with_user_agent("codex_cli_rs/0.147.0 (test)");
+    let server = MockServer::start_managed_with_user_agent("codex-tamer/0.147.0 (test)");
     let invoked = server._temp.path().join("codex-invoked");
     let fake_codex = server._temp.path().join("codex");
     fs::write(
@@ -1789,7 +1789,7 @@ fn incompatible_existing_managed_listener_fails_without_invoking_codex() {
 
 #[test]
 fn explicit_managed_target_with_configured_servers_keeps_managed_validation() {
-    let server = MockServer::start_managed_with_user_agent("codex_cli_rs/0.147.0 (test)");
+    let server = MockServer::start_managed_with_user_agent("codex-tamer/0.147.0 (test)");
     fs::create_dir_all(server.config.parent().expect("config parent")).expect("config parent");
     fs::write(
         &server.config,
@@ -1813,7 +1813,7 @@ fn malformed_reachable_managed_listener_fails_without_invoking_codex() {
     use std::os::unix::fs::PermissionsExt;
 
     let server = MockServer::start_managed_with_initialize_override(
-        "codex_cli_rs/0.146.0 (test)",
+        "codex-tamer/0.146.0 (test)",
         Some(json!({"unexpected": true})),
     );
     let invoked = server._temp.path().join("codex-invoked");
@@ -2061,6 +2061,7 @@ fn missing_config_starts_the_selected_codex_listener_with_exact_arguments() {
     let socket = socket_dir.join("app-server.sock");
     let marker = temp.path().join("spawned.args");
     let observed_home = temp.path().join("spawned.home");
+    let observed_originator = temp.path().join("spawned.originator");
     let launcher_pid = temp.path().join("spawned.launcher.pid");
     let descendant_pid = temp.path().join("spawned.descendant.pid");
     let helper = std::env::current_exe().expect("test helper executable");
@@ -2075,6 +2076,11 @@ if [ "$1" = "--version" ]; then
 fi
 printf '%s\n' "$@" > '{}'
 printf '%s' "$CODEX_HOME" > '{}'
+if [ "${{CODEX_INTERNAL_ORIGINATOR_OVERRIDE+x}}" = x ]; then
+  printf '%s' "$CODEX_INTERNAL_ORIGINATOR_OVERRIDE" > '{}'
+else
+  printf '<unset>' > '{}'
+fi
 printf '%s' "$$" > '{}'
 CODEX_TAMER_TEST_MANAGED_SOCKET='{}' \
 CODEX_TAMER_TEST_MANAGED_HOME="$CODEX_HOME" \
@@ -2089,6 +2095,8 @@ exit 0
 "#,
             marker.display(),
             observed_home.display(),
+            observed_originator.display(),
+            observed_originator.display(),
             launcher_pid.display(),
             socket.display(),
             helper.display(),
@@ -2104,6 +2112,7 @@ exit 0
         .env_remove("CODEX_TAMER_SERVER")
         .env("HOME", &user_home)
         .env("CODEX_HOME", &codex_home)
+        .env("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex_vscode")
         .env("XDG_RUNTIME_DIR", &runtime)
         .arg("--codex")
         .arg(&fake_codex)
@@ -2122,6 +2131,10 @@ exit 0
     assert_eq!(
         fs::read_to_string(&observed_home).expect("spawn home"),
         codex_home.to_string_lossy()
+    );
+    assert_eq!(
+        fs::read_to_string(&observed_originator).expect("spawn originator"),
+        "<unset>"
     );
 
     let process_record = socket_dir.join("process.json");
@@ -2291,7 +2304,7 @@ fn servers_stop_refuses_a_reachable_external_listener_without_a_process_record()
 #[test]
 fn servers_stop_rejects_a_malformed_reachable_listener_without_a_process_record() {
     let server = MockServer::start_managed_with_initialize_override(
-        "codex_cli_rs/0.146.0 (test)",
+        "codex-tamer/0.146.0 (test)",
         Some(json!({"unexpected": true})),
     );
 

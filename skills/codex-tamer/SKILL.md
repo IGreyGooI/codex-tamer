@@ -73,9 +73,11 @@ Resolve startup inputs in these orders:
   `CODEX_HOME/packages/standalone/current/codex` > `codex` on `PATH`
 
 Require exact reviewed Codex `0.146.0`. Validate both the selected binary and
-the connected server's initialize `userAgent` as `codex_cli_rs/0.146.0` and its
-`codexHome`; never silently fall back after an explicit binary is rejected. Do
-not run
+the connected server's initialize `userAgent` as `codex-tamer/0.146.0` and its
+`codexHome`. Remove an inherited `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` when
+starting the managed listener so a VS Code shell cannot rebrand it as
+`codex_vscode`; never silently fall back after an explicit binary is rejected.
+Do not run
 `codex app-server daemon bootstrap`; it installs a detached hourly updater.
 
 Use an explicit target when the user selected another listener:

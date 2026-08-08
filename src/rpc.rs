@@ -21,6 +21,7 @@ use crate::config::Endpoint;
 
 #[cfg(unix)]
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
+pub(crate) const CLIENT_NAME: &str = "codex-tamer";
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
@@ -269,8 +270,8 @@ impl RpcClient {
                 "initialize",
                 json!({
                     "clientInfo": {
-                        "name": "codex-tamer",
-                        "title": "codex-tamer",
+                        "name": CLIENT_NAME,
+                        "title": CLIENT_NAME,
                         "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
@@ -512,6 +513,14 @@ mod tests {
             };
             let initialize: Value = serde_json::from_str(&initialize).unwrap();
             assert_eq!(initialize["method"], "initialize");
+            assert_eq!(
+                initialize["params"]["clientInfo"],
+                json!({
+                    "name": CLIENT_NAME,
+                    "title": CLIENT_NAME,
+                    "version": env!("CARGO_PKG_VERSION")
+                })
+            );
             websocket
                 .send(Message::Text(
                     json!({"id": initialize["id"], "result": {

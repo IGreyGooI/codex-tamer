@@ -146,6 +146,7 @@ export function buildReleaseBundle({
 	assertRegularFile(join(root, "scripts", "install-bundle.mjs"), "bundle installer");
 	assertRegularFile(join(root, "skills", "codex-tamer", "SKILL.md"), "Skill manifest");
 	assertRegularFile(join(root, "LICENSE"), "license");
+	assertRegularFile(join(root, "README.md"), "README");
 
 	const skillSource = join(root, "skills", "codex-tamer");
 	if (pathsOverlap(skillSource, outDir)) {
@@ -172,6 +173,7 @@ export function buildReleaseBundle({
 		copyRegularDirectory(skillSource, join(stagedPath, "skills", "codex-tamer"), "Skill");
 		cpSync(join(root, "scripts", "install-bundle.mjs"), join(stagedPath, "install.mjs"));
 		cpSync(join(root, "LICENSE"), join(stagedPath, "LICENSE"));
+		cpSync(join(root, "README.md"), join(stagedPath, "README.md"));
 		const manifest = {
 			name: "codex-tamer",
 			version,

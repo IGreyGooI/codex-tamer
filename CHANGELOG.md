@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Validate managed connections against their real `codex-tamer/0.146.0`
+  initialize identity, and prevent VS Code's inherited
+  `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` from rebranding that listener as the
+  incompatible `codex_vscode` product.
+- Put install steps and the Node.js 20+ prerequisite directly in public Release
+  notes, and include the versioned README in every platform archive.
+- Keep the public README install example synchronized with the version selected
+  by the release script.
+
 ## [0.3.1] - 2026-08-08
 
 ### Changed

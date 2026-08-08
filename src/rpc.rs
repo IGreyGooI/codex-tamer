@@ -502,6 +502,7 @@ mod tests {
     async fn server_request_with_matching_id_does_not_complete_client_request() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let server_codex_home = std::env::current_dir().unwrap().join("mock-codex");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut websocket = accept_async(stream).await.unwrap();
@@ -515,7 +516,7 @@ mod tests {
                 .send(Message::Text(
                     json!({"id": initialize["id"], "result": {
                         "userAgent": "codex_cli_rs/0.146.0 (test)",
-                        "codexHome": "/tmp/mock-codex",
+                        "codexHome": server_codex_home,
                         "platformFamily": "unix",
                         "platformOs": "linux"
                     }})

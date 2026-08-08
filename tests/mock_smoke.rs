@@ -1716,10 +1716,10 @@ fn managed_status_reports_stopped_only_for_an_absent_listener() {
     let temp = TempDir::new().expect("tempdir");
     let user_home = temp.path().join("home");
     let codex_home = temp.path().join("codex-home");
-    let runtime = temp.path().join("runtime");
+    let (runtime, _runtime_temp) = managed_runtime_fixture(&temp);
     fs::create_dir(&user_home).expect("user home");
     fs::create_dir(&codex_home).expect("codex home");
-    fs::create_dir(&runtime).expect("runtime");
+    fs::create_dir_all(&runtime).expect("runtime");
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("runtime mode");
 
     let output = Command::cargo_bin("codex-tamer")
@@ -1941,7 +1941,7 @@ fn process_record_failure_terminates_the_spawned_app_server() {
 
     let temp = TempDir::new().expect("tempdir");
     let codex_home = temp.path().join("codex-home");
-    let runtime = temp.path().join("runtime");
+    let (runtime, _runtime_temp) = managed_runtime_fixture(&temp);
     let user_home = temp.path().join("user-home");
     fs::create_dir_all(&codex_home).expect("codex home");
     fs::create_dir_all(&runtime).expect("runtime");
@@ -1972,21 +1972,19 @@ fn process_record_failure_terminates_the_spawned_app_server() {
     let fake_codex = temp.path().join("codex");
     fs::write(
         &fake_codex,
-        format!(
-            r#"#!/bin/sh
+        r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
   printf 'codex-cli 0.146.0\n'
   exit 0
 fi
-printf '%s' "$$" > '{}'
+printf '%s' "$$" > "${CODEX_TAMER_TEST_LAUNCHER_PID}.tmp"
+mv "${CODEX_TAMER_TEST_LAUNCHER_PID}.tmp" "$CODEX_TAMER_TEST_LAUNCHER_PID"
 /bin/sleep 3 &
 descendant=$!
-printf '%s' "$descendant" > '{}'
-exit 0
+printf '%s' "$descendant" > "${CODEX_TAMER_TEST_DESCENDANT_PID}.tmp"
+mv "${CODEX_TAMER_TEST_DESCENDANT_PID}.tmp" "$CODEX_TAMER_TEST_DESCENDANT_PID"
+wait "$descendant"
 "#,
-            pid_file.display(),
-            descendant_pid_file.display()
-        ),
     )
     .expect("fake codex");
     fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("fake codex mode");
@@ -1998,6 +1996,8 @@ exit 0
         .env("HOME", &user_home)
         .env("CODEX_HOME", &codex_home)
         .env("XDG_RUNTIME_DIR", &runtime)
+        .env("CODEX_TAMER_TEST_LAUNCHER_PID", &pid_file)
+        .env("CODEX_TAMER_TEST_DESCENDANT_PID", &descendant_pid_file)
         .arg("--codex")
         .arg(&fake_codex)
         .args(["servers", "start", "--json"])
@@ -2029,16 +2029,21 @@ fn assert_recorded_process_exited(pid_file: &std::path::Path, label: &str) {
     use std::time::{Duration, Instant};
 
     let marker_deadline = Instant::now() + Duration::from_millis(500);
-    while !pid_file.exists() && Instant::now() < marker_deadline {
+    let pid = loop {
+        match fs::read_to_string(pid_file) {
+            Ok(contents) => match contents.parse::<libc::pid_t>() {
+                Ok(pid) => break pid,
+                Err(_) if Instant::now() < marker_deadline => {}
+                Err(error) => panic!("{label} did not write a numeric pid: {error}"),
+            },
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && Instant::now() < marker_deadline => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("failed to read {label} pid: {error}"),
+        }
         thread::sleep(Duration::from_millis(10));
-    }
-    if !pid_file.exists() {
-        return;
-    }
-    let pid: libc::pid_t = fs::read_to_string(pid_file)
-        .expect("spawned pid")
-        .parse()
-        .expect("numeric pid");
+    };
     let exit_deadline = Instant::now() + Duration::from_millis(500);
     while process_exists(pid) && Instant::now() < exit_deadline {
         thread::sleep(Duration::from_millis(10));
@@ -2512,7 +2517,12 @@ path = "/tmp/personal.sock"
         .assert()
         .success()
         .stdout(predicates::str::contains("while IFS= read -r candidate"))
-        .stdout(predicates::str::contains("COMPREPLY+=(\"$candidate\")"))
+        .stdout(predicates::str::contains(
+            "COMPREPLY[${#COMPREPLY[@]}]=\"$candidate\"",
+        ))
+        .stdout(predicates::str::contains(
+            "done <<< \"$(codex-tamer __complete",
+        ))
         .stdout(predicates::str::contains(
             "complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer",
         ))

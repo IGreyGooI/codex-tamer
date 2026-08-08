@@ -351,8 +351,10 @@ fn bash_completion_script() -> String {
   cur="${COMP_WORDS[COMP_CWORD]}"
   words=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
   while IFS= read -r candidate; do
-    COMPREPLY+=("$candidate")
-  done < <(codex-tamer __complete -- "$cur" "${words[@]}" 2>/dev/null)
+    if [[ -n "$candidate" ]]; then
+      COMPREPLY[${#COMPREPLY[@]}]="$candidate"
+    fi
+  done <<< "$(codex-tamer __complete -- "$cur" "${words[@]}" 2>/dev/null)"
 }
 
 complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer

@@ -13,7 +13,7 @@ Codex `0.146` protocol baseline.
 
 | codex-tamer | Codex app release | Upstream reference | Reviewed integration scope |
 | --- | --- | --- | --- |
-| Unreleased | 0.146 inherited from codex-threads 0.2.4 | `rust-v0.146.0` (`e363b08c9175ac1cbe5893615dd2cb9ddf95043b`) | Headless hard fork; independent wait/result/follow use `thread/resume`, `thread/turns/list`, and existing notifications. Raw history injection adopts the 0.146 stable `thread/inject_items` request with required `threadId` and `items` array. No post-0.146 API is assumed. |
+| Unreleased | 0.146 inherited from codex-threads 0.2.4 | `rust-v0.146.0` (`e363b08c9175ac1cbe5893615dd2cb9ddf95043b`) | Headless hard fork; independent wait/result/follow use `thread/resume`, `thread/turns/list`, and existing notifications. Raw history injection adopts the 0.146 stable `thread/inject_items` request with required `threadId` and `items` array. Unix managed startup invokes the reviewed `app-server --listen unix://...` contract, validates initialize `userAgent` and `codexHome`, and relies on 0.146 thread listing to scan session JSONL and repair state-database metadata. `steer` no longer resumes an unloaded thread. No post-0.146 API is assumed. |
 
 ## Preserved Upstream Reviews
 

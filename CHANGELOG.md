@@ -15,6 +15,13 @@
 
 ### Added
 
+- Add a Unix-only default shared app-server per canonical `CODEX_HOME`, with a
+  private stable runtime socket, concurrent startup locking, exact Codex 0.146.0
+  identity validation, detached listener startup, and explicit
+  `servers start`, `servers status`, and `servers stop` lifecycle commands.
+- Add `[managed].codex`, `[managed].codex_home`, `--codex`, and `--codex-home`
+  overrides for selecting the managed Codex runtime without conflating runtime
+  identity with thread model defaults.
 - Add independent `wait`, `result`, and `events follow` commands so another
   Agent process can reattach to a known thread/turn pair after a no-wait start.
 - Add validated raw history injection through Codex 0.146
@@ -30,11 +37,18 @@
 
 ### Changed
 
+- Allow every ordinary app-server JSON-RPC request up to 120 seconds without a
+  response, and document updated-descending order for bounded `--since` thread
+  discovery over large persisted session stores.
+- Treat a missing implicit config as an empty config and automatically select
+  the managed listener when no servers are configured. Preserve explicit
+  endpoint and server-alias priority, and keep probes from starting a listener.
 - Reframe product documentation and the packaged Skill around independent Agent
   control through JSON/NDJSON CLI commands.
 - Harden release automation with a validated configurable remote, a complete
   locked preflight before tagging, Node.js 20 CI coverage, an enforced Linux
-  glibc/OpenSSL ABI baseline, and draft-only GitHub Release updates.
+  glibc/OpenSSL ABI baseline, matching official fetch/push URLs, tag provenance
+  checks against `main`, and draft-only GitHub Release updates.
 - Declare the `codex-tamer` PATH dependency in the packaged Skill instead of
   writing machine-specific binary paths into Skill instructions.
 - Preserve structured Codex turn errors in failed terminal events and aggregate
@@ -52,6 +66,32 @@
 
 ### Fixed
 
+- Update `anyhow` to `1.0.104` to address `RUSTSEC-2026-0190`, an unsound
+  `Error::downcast_mut()` implementation in versions before `1.0.103`.
+- Make `servers status` reserve successful `stopped` output for an absent
+  listener and fail on incompatible, malformed, or insecure managed targets.
+- Resolve `CODEX_HOME` through symlink-aware parent traversal, including
+  dangling final symlinks, so one home cannot change endpoint identity after
+  creation or through `symlink/..` paths.
+- Bound both the managed readiness handshake and `codex --version` probe, and
+  bound existing-listener startup probes. Keep the Windows WebSocket-only build
+  warning-free under the release Clippy gate.
+- Keep the fallback managed Unix socket below macOS path limits, allow explicit
+  `--server managed` selection through a reserved alias, require same-UID peers,
+  and reject reachable unverified listeners from `servers stop` even when no
+  ownership record exists.
+- Keep managed-process ownership stable across timezone and `PATH` changes,
+  bind schema-versioned records to the system boot and verified Unix peer
+  process group, preserve unverifiable legacy evidence, refuse to overwrite a
+  live startup record, wait for the complete managed process group during
+  shutdown, and derive one canonical endpoint before and after a missing
+  `CODEX_HOME` is created.
+- Prevent `steer` from resuming an unloaded persisted thread and presenting the
+  result as control of an active turn owned by another app-server process.
+- Clarify in the packaged Skill and README that VS Code stdio-only sessions
+  cannot be attached after start, that `CODEX_ENDPOINT` is not an automatic
+  target source, and how to establish and validate a listener for future
+  trackable sessions without implicitly enabling Codex's standalone updater.
 - Retry the fallback turn-history poll when Codex reports that a new thread is
   not materialized yet, while continuing to surface unrelated `-32600` errors.
 - Keep fallback turn-history polling cancellable by command timeout and Ctrl-C,

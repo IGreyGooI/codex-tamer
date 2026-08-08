@@ -3,6 +3,8 @@ name = "codex-tamer"
 version = "0.2.4"
 edition = "2024"
 license = "MIT"
+description = "Headless Agent-facing CLI for querying and controlling Codex app-server threads"
+repository = "https://github.com/IGreyGooI/codex-tamer"
 publish = false
 
 [[bin]]
@@ -16,6 +18,7 @@ chrono = { version = "0.4.42", default-features = false, features = ["clock", "s
 clap = { version = "4.5.53", features = ["derive", "env"] }
 fd-lock = "4.0.4"
 futures-util = "0.3.32"
+libc = "0.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"

@@ -106,6 +106,13 @@ function compileNativeCliFixture(directory, version) {
 	return binary;
 }
 
+function repositoryVersion() {
+	const cargoToml = readFileSync(join(import.meta.dirname, "..", "Cargo.toml"), "utf8");
+	const match = cargoToml.match(/\[package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/);
+	assert.ok(match, "repository Cargo.toml package version");
+	return match[1];
+}
+
 test("builds a platform bundle containing the native CLI and unchanged skill", () => {
 	withTempDirectory((directory) => {
 		const root = join(directory, "repo");
@@ -267,7 +274,7 @@ test("archives a Windows bundle as ZIP", () => {
 
 test("the packaging CLI builds an archive from the repository", () => {
 	withTempDirectory((directory) => {
-		const binary = compileNativeCliFixture(directory, "0.2.4");
+		const binary = compileNativeCliFixture(directory, repositoryVersion());
 		const target = nativeTarget();
 		const packaged = spawnSync(
 			process.execPath,

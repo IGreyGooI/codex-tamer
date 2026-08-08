@@ -7,7 +7,7 @@
  *   node scripts/release.mjs patch
  *   node scripts/release.mjs minor
  *   node scripts/release.mjs major
- *   node scripts/release.mjs 0.2.3
+ *   node scripts/release.mjs 0.3.0
  */
 
 import { execFileSync } from "node:child_process";
@@ -89,6 +89,21 @@ export function validateReleasePushUrl(pushUrl) {
 		);
 	}
 	return repository;
+}
+
+export function validateReleaseRemoteUrls(fetchUrl, pushUrl) {
+	let fetchRepository;
+	try {
+		fetchRepository = validateReleasePushUrl(fetchUrl);
+	} catch (error) {
+		throw new Error(`release remote fetch URL is invalid: ${error.message}`);
+	}
+	try {
+		validateReleasePushUrl(pushUrl);
+	} catch (error) {
+		throw new Error(`release remote push URL is invalid: ${error.message}`);
+	}
+	return fetchRepository;
 }
 
 export function releaseNotesFromChangelog(content, version) {
@@ -250,11 +265,14 @@ function ensureTools() {
 }
 
 function ensureReleasePushTarget(releaseRemote) {
+	const fetchUrl = runFile("git", ["remote", "get-url", releaseRemote], {
+		silent: true,
+	}).trim();
 	const pushUrl = runFile("git", ["remote", "get-url", "--push", releaseRemote], {
 		silent: true,
 	}).trim();
 	try {
-		validateReleasePushUrl(pushUrl);
+		validateReleaseRemoteUrls(fetchUrl, pushUrl);
 	} catch (error) {
 		console.error(`Error: ${error.message}`);
 		process.exit(1);

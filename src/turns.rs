@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 use crate::config::Target;
 use crate::errors::app_server_error;
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
-use crate::session::request_with_direct_input_retry;
 use crate::session::resume_thread_for_action_with_notifications;
+use crate::session::{request_direct_input_without_resume, request_with_direct_input_retry};
 
 /// How long the watched turn must stay silent on the live subscription
 /// before the fallback poll runs. While notifications for the turn are
@@ -885,19 +885,12 @@ pub async fn steer_turn(
     thread_id: String,
     turn_id: String,
     prompt: String,
-    yolo: bool,
+    _yolo: bool,
 ) -> Result<Value> {
     let params = json!({"threadId": thread_id, "expectedTurnId": turn_id, "input": [{"type": "text", "text": prompt, "textElements": []}]});
-    let result = request_with_direct_input_retry(
-        client,
-        "turn/steer",
-        params,
-        &thread_id,
-        yolo,
-        || {},
-        |_| {},
-    )
-    .await?;
+    let result =
+        request_direct_input_without_resume(client, "turn/steer", params, &thread_id, |_| {})
+            .await?;
     let response_turn_id = result["turnId"]
         .as_str()
         .filter(|turn_id| !turn_id.is_empty())

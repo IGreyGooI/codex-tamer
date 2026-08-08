@@ -14,6 +14,22 @@ use crate::config::parse_reasoning_effort;
 pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        conflicts_with = "connect",
+        help = "Codex executable used to start the default managed app-server"
+    )]
+    pub codex: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        conflicts_with = "connect",
+        help = "CODEX_HOME served by the default managed app-server"
+    )]
+    pub codex_home: Option<PathBuf>,
     #[arg(long, global = true)]
     pub connect: Option<String>,
     #[arg(
@@ -99,6 +115,18 @@ pub struct ServersCommand {
 #[derive(Debug, Subcommand)]
 pub enum ServersSubcommand {
     Ping(ServersPingCommand),
+    #[command(about = "Start or reuse the CODEX_HOME managed app-server")]
+    Start(ManagedServerCommand),
+    #[command(about = "Probe the CODEX_HOME managed app-server without starting it")]
+    Status(ManagedServerCommand),
+    #[command(about = "Stop the app-server process started by codex-tamer")]
+    Stop(ManagedServerCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ManagedServerCommand {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

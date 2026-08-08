@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -10,16 +12,30 @@ use url::Url;
 pub const KNOWN_REASONING_EFFORTS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
+pub const MANAGED_SERVER_ALIAS: &str = "managed";
+#[cfg(unix)]
+const MANAGED_SOCKET_FILE: &str = "app-server.sock";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub managed: ManagedConfig,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub model_reasoning_effort: Option<String>,
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConfig {
+    #[serde(default)]
+    pub codex: Option<PathBuf>,
+    #[serde(default)]
+    pub codex_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -146,8 +162,19 @@ impl ServerConfig {
 }
 
 pub fn load_config(path: &Path) -> Result<AppConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read config `{}`", path.display()))?;
+    load_config_or_default(path, true)
+}
+
+pub fn load_config_or_default(path: &Path, explicit: bool) -> Result<AppConfig> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !explicit => {
+            return Ok(AppConfig::default());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read config `{}`", path.display()));
+        }
+    };
     let config: AppConfig = toml::from_str(&text)
         .with_context(|| format!("failed to parse config `{}`", path.display()))?;
     validate_config(&config)?;
@@ -155,6 +182,8 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn validate_config(config: &AppConfig) -> Result<()> {
+    validate_optional_path("managed.codex", config.managed.codex.as_deref())?;
+    validate_optional_path("managed.codex_home", config.managed.codex_home.as_deref())?;
     validate_defaults(
         "global config",
         config.model.as_deref(),
@@ -164,6 +193,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         if alias.trim().is_empty() {
             return Err(anyhow!("server alias must not be empty"));
         }
+        if alias == MANAGED_SERVER_ALIAS {
+            return Err(anyhow!(
+                "server alias `{MANAGED_SERVER_ALIAS}` is reserved for the managed app-server target"
+            ));
+        }
         validate_server_shape(alias, server)?;
         validate_server_endpoint(alias, server)?;
         validate_defaults(
@@ -171,6 +205,13 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
             server.model.as_deref(),
             server.model_reasoning_effort.as_deref(),
         )?;
+    }
+    Ok(())
+}
+
+fn validate_optional_path(scope: &str, path: Option<&Path>) -> Result<()> {
+    if path.is_some_and(|path| path.as_os_str().is_empty()) {
+        return Err(anyhow!("{scope} must not be empty"));
     }
     Ok(())
 }
@@ -389,11 +430,13 @@ pub fn resolve_target_from(
     server_env: Option<&str>,
 ) -> Result<Target> {
     if let Some(alias) = server_flag.or(server_env) {
-        let server = config
-            .servers
-            .get(alias)
-            .ok_or_else(|| anyhow!("unknown server alias `{alias}`"))?;
-        return Target::configured(alias, server, config);
+        if alias == MANAGED_SERVER_ALIAS {
+            return resolve_managed_target(config);
+        }
+        if let Some(server) = config.servers.get(alias) {
+            return Target::configured(alias, server, config);
+        }
+        return Err(anyhow!("unknown server alias `{alias}`"));
     }
 
     if config.servers.len() == 1 {
@@ -402,12 +445,128 @@ pub fn resolve_target_from(
     }
 
     if config.servers.is_empty() {
-        return Err(anyhow!("no servers configured"));
+        return resolve_managed_target(config);
     }
 
     Err(anyhow!(
         "multiple servers configured; pass --server ALIAS or set CODEX_TAMER_SERVER"
     ))
+}
+
+pub fn resolve_managed_target(config: &AppConfig) -> Result<Target> {
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        Err(anyhow!(
+            "automatic managed app-server is unsupported on this platform; configure a ws:// or wss:// server endpoint"
+        ))
+    }
+
+    #[cfg(unix)]
+    {
+        let codex_home = resolve_codex_home(config)?;
+        let runtime_root = managed_runtime_root()?;
+        Ok(Target {
+            server: MANAGED_SERVER_ALIAS.to_string(),
+            endpoint: Endpoint::Unix {
+                path: managed_socket_path_from(&codex_home, &runtime_root),
+            },
+            model: config.model.clone(),
+            model_reasoning_effort: config.model_reasoning_effort.clone(),
+        })
+    }
+}
+
+pub fn resolve_codex_home(config: &AppConfig) -> Result<PathBuf> {
+    let path = config
+        .managed
+        .codex_home
+        .clone()
+        .or_else(|| env::var_os("CODEX_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| home_dir().join(".codex"));
+    let path = absolute_path(path, "CODEX_HOME")?;
+    canonicalize_with_missing_tail(&path)
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("failed to resolve CODEX_HOME `{}`", path.display()))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow!("failed to resolve CODEX_HOME `{}`", path.display()))?;
+            let resolved_parent = canonicalize_with_missing_tail(parent)?;
+            let candidate = resolved_parent.join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(&candidate).with_context(|| {
+                        format!(
+                            "failed to resolve CODEX_HOME symlink `{}`",
+                            candidate.display()
+                        )
+                    })?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        resolved_parent.join(target)
+                    };
+                    canonicalize_with_missing_tail(&target)
+                }
+                Ok(_) => std::fs::canonicalize(&candidate)
+                    .with_context(|| format!("failed to resolve CODEX_HOME `{}`", path.display())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
+                Err(error) => Err(error)
+                    .with_context(|| format!("failed to resolve CODEX_HOME `{}`", path.display())),
+            }
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to resolve CODEX_HOME `{}`", path.display()))
+        }
+    }
+}
+
+#[cfg(unix)]
+pub fn managed_runtime_root() -> Result<PathBuf> {
+    let uid = unsafe { libc::geteuid() };
+    managed_runtime_root_from(env::var_os("XDG_RUNTIME_DIR").as_deref(), uid)
+}
+
+#[cfg(unix)]
+pub(crate) fn managed_runtime_root_from(
+    xdg_runtime_dir: Option<&OsStr>,
+    uid: u32,
+) -> Result<PathBuf> {
+    if let Some(path) = xdg_runtime_dir {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(anyhow!("XDG_RUNTIME_DIR must be an absolute path"));
+        }
+        return Ok(path.join("codex-tamer"));
+    }
+    Ok(PathBuf::from("/tmp").join(format!("codex-tamer-{uid}")))
+}
+
+#[cfg(unix)]
+pub fn managed_socket_path_from(codex_home: &Path, runtime_root: &Path) -> PathBuf {
+    let digest = blake3::hash(codex_home.as_os_str().as_encoded_bytes());
+    runtime_root
+        .join(&digest.to_hex().as_str()[..24])
+        .join(MANAGED_SOCKET_FILE)
+}
+
+fn absolute_path(path: PathBuf, scope: &str) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(anyhow!("{scope} must not be empty"));
+    }
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(env::current_dir()
+        .with_context(|| format!("failed to resolve current directory for {scope}"))?
+        .join(path))
 }
 
 pub fn resolve_direct_target(

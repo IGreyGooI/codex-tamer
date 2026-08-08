@@ -7,6 +7,7 @@ import {
 	releaseNotesFromChangelog,
 	releasePreflightCommands,
 	releaseRemoteFromEnvironment,
+	validateReleaseRemoteUrls,
 	validateReleasePushUrl,
 } from "./release.mjs";
 
@@ -51,6 +52,11 @@ test("tag workflow builds, verifies, and uploads every supported platform bundle
 	assert.match(workflow, /libcrypto\\\.so\\\.3/);
 	assert.match(workflow, /readFileSync\("CHANGELOG\.md"/);
 	assert.match(workflow, /--notes-file "\$release_notes"/);
+	assert.match(workflow, /Verify tag provenance/);
+	assert.match(
+		workflow,
+		/git merge-base --is-ancestor "\$GITHUB_SHA" refs\/remotes\/origin\/main/,
+	);
 	assert.doesNotMatch(workflow, /--generate-notes/);
 	assert.match(workflow, /existing_is_draft/);
 	assert.match(workflow, /Refusing to modify published GitHub Release/);
@@ -89,6 +95,21 @@ test("the local release script validates a configurable private release remote",
 	assert.throws(
 		() => validateReleasePushUrl("https://token@github.com/IGreyGooI/codex-tamer.git"),
 		/invalid GitHub push URL/i,
+	);
+	assert.equal(
+		validateReleaseRemoteUrls(
+			"https://github.com/IGreyGooI/codex-tamer.git",
+			"git@github.com:IGreyGooI/codex-tamer.git",
+		),
+		"IGreyGooI/codex-tamer",
+	);
+	assert.throws(
+		() =>
+			validateReleaseRemoteUrls(
+				"https://github.com/example/fork.git",
+				"https://github.com/IGreyGooI/codex-tamer.git",
+			),
+		/release remote fetch URL/i,
 	);
 });
 
@@ -148,4 +169,14 @@ test("the local release script leaves GitHub Release creation to the tag workflo
 	assert.doesNotMatch(releaseScript, /gh release create/);
 	const readme = readFileSync(join(root, "README.md"), "utf8");
 	assert.match(readme, /tag workflow/i);
+});
+
+test("the README documents unauthenticated public release installation", () => {
+	const readme = readFileSync(join(root, "README.md"), "utf8");
+	const normalizedReadme = readme.replace(/\s+/g, " ");
+	assert.match(normalizedReadme, /do not need[^.]*GitHub authentication/i);
+	assert.match(readme, /curl --fail --location --remote-name/);
+	assert.match(readme, /sha256sum -c "\$\{ASSET\}\.sha256"/);
+	assert.match(readme, /node install\.mjs --json/);
+	assert.doesNotMatch(readme, /For the private repository/i);
 });

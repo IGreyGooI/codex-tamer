@@ -24,6 +24,8 @@ struct MockServer {
     socket: PathBuf,
     config: PathBuf,
     received: Arc<Mutex<Vec<Value>>>,
+    managed_home: Option<PathBuf>,
+    managed_runtime: Option<PathBuf>,
 }
 
 struct TcpMockServer {
@@ -358,34 +360,88 @@ impl MockServer {
         .expect("config");
         let std_listener = StdUnixListener::bind(&socket).expect("bind mock socket");
         std_listener.set_nonblocking(true).expect("nonblocking");
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_for_thread = Arc::clone(&received);
         let behavior = MockBehavior::new(
             turn_notification_mode,
             malformed_turn_start,
             reject_first,
             response_overrides,
         );
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("runtime");
-            runtime.block_on(async move {
-                let listener = UnixListener::from_std(std_listener).expect("tokio listener");
-                loop {
-                    let (stream, _) = listener.accept().await.expect("accept");
-                    let received = Arc::clone(&received_for_thread);
-                    let behavior = behavior.clone();
-                    tokio::spawn(async move {
-                        handle_connection(stream, received, behavior).await;
-                    });
-                }
-            });
-        });
+        let received = spawn_mock_listener(std_listener, behavior);
 
         Self {
             _temp: temp,
             socket,
             config,
             received,
+            managed_home: None,
+            managed_runtime: None,
+        }
+    }
+
+    fn start_managed() -> Self {
+        Self::start_managed_with_user_agent("codex_cli_rs/0.146.0 (test)")
+    }
+
+    fn start_managed_with_user_agent(user_agent: &str) -> Self {
+        Self::start_managed_with_initialize_override(user_agent, None)
+    }
+
+    fn start_managed_with_initialize_override(
+        user_agent: &str,
+        initialize_override: Option<Value>,
+    ) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let managed_home = temp.path().join("codex-home");
+        let managed_runtime = temp.path().join("runtime");
+        let fake_user_home = temp.path().join("user-home");
+        fs::create_dir_all(&managed_home).expect("codex home");
+        fs::create_dir_all(&managed_runtime).expect("runtime");
+        fs::create_dir_all(&fake_user_home).expect("user home");
+        fs::set_permissions(&managed_runtime, fs::Permissions::from_mode(0o700))
+            .expect("runtime permissions");
+        let managed_home = fs::canonicalize(managed_home).expect("canonical codex home");
+        let digest = blake3::hash(managed_home.as_os_str().as_encoded_bytes());
+        let socket_dir = managed_runtime
+            .join("codex-tamer")
+            .join(&digest.to_hex().as_str()[..24]);
+        fs::create_dir_all(&socket_dir).expect("socket dir");
+        fs::set_permissions(
+            managed_runtime.join("codex-tamer"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("managed root permissions");
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
+            .expect("socket dir permissions");
+        let socket = socket_dir.join("app-server.sock");
+        let config = fake_user_home.join(".config/codex-tamer/config.toml");
+        let std_listener = StdUnixListener::bind(&socket).expect("bind managed mock socket");
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let initialize = initialize_override.unwrap_or_else(|| {
+            json!({
+                "userAgent": user_agent,
+                "codexHome": managed_home.clone(),
+                "platformFamily": "unix",
+                "platformOs": "linux"
+            })
+        });
+        let responses = Arc::new(HashMap::from([("initialize".to_string(), initialize)]));
+        let behavior = MockBehavior::new(
+            TurnNotificationMode::Complete,
+            false,
+            RejectFirst::none(),
+            responses,
+        );
+        let received = spawn_mock_listener(std_listener, behavior);
+
+        Self {
+            _temp: temp,
+            socket,
+            config,
+            received,
+            managed_home: Some(managed_home),
+            managed_runtime: Some(managed_runtime),
         }
     }
 
@@ -402,6 +458,29 @@ impl MockServer {
             .env_remove("XDG_STATE_HOME")
             .arg("--config")
             .arg(&self.config);
+        command
+    }
+
+    fn managed_command(&self) -> Command {
+        let mut command = Command::cargo_bin("codex-tamer").expect("binary");
+        let user_home = self
+            .config
+            .parent()
+            .and_then(|path| path.parent())
+            .and_then(|path| path.parent())
+            .expect("fake user home");
+        command
+            .env_remove("CODEX_TAMER_CONFIG")
+            .env_remove("CODEX_TAMER_SERVER")
+            .env("HOME", user_home)
+            .env(
+                "CODEX_HOME",
+                self.managed_home.as_ref().expect("managed codex home"),
+            )
+            .env(
+                "XDG_RUNTIME_DIR",
+                self.managed_runtime.as_ref().expect("managed runtime"),
+            );
         command
     }
 
@@ -446,12 +525,76 @@ impl MockServer {
     }
 }
 
+fn spawn_mock_listener(
+    std_listener: StdUnixListener,
+    behavior: MockBehavior,
+) -> Arc<Mutex<Vec<Value>>> {
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let received_for_thread = Arc::clone(&received);
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async move {
+            let listener = UnixListener::from_std(std_listener).expect("tokio listener");
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let received = Arc::clone(&received_for_thread);
+                let behavior = behavior.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, received, behavior).await;
+                });
+            }
+        });
+    });
+    received
+}
+
+#[test]
+#[ignore]
+fn managed_listener_process_helper() {
+    let Some(socket) = std::env::var_os("CODEX_TAMER_TEST_MANAGED_SOCKET") else {
+        return;
+    };
+    let codex_home =
+        std::env::var_os("CODEX_TAMER_TEST_MANAGED_HOME").expect("managed helper Codex home");
+    let std_listener = StdUnixListener::bind(PathBuf::from(socket)).expect("bind managed helper");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    let behavior = MockBehavior::new(
+        TurnNotificationMode::Complete,
+        false,
+        RejectFirst::none(),
+        Arc::new(HashMap::from([(
+            "initialize".to_string(),
+            json!({
+                "userAgent": "codex_cli_rs/0.146.0 (test)",
+                "codexHome": PathBuf::from(codex_home),
+                "platformFamily": "unix",
+                "platformOs": "linux"
+            }),
+        )])),
+    );
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async move {
+        let listener = UnixListener::from_std(std_listener).expect("tokio listener");
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let received = Arc::clone(&received);
+            let behavior = behavior.clone();
+            tokio::spawn(async move {
+                handle_connection(stream, received, behavior).await;
+            });
+        }
+    });
+}
+
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     received: Arc<Mutex<Vec<Value>>>,
     behavior: MockBehavior,
 ) {
-    let ws = accept_async(stream).await.expect("websocket accept");
+    let Ok(ws) = accept_async(stream).await else {
+        return;
+    };
     handle_websocket(ws, received, behavior).await;
 }
 
@@ -1347,6 +1490,58 @@ fn connect_bypasses_config_for_servers_ping() {
 }
 
 #[test]
+fn connect_servers_listing_does_not_invent_a_managed_target() {
+    let server = MockServer::start();
+    let output = Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .arg("--connect")
+        .arg(server.endpoint())
+        .args(["servers", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("json output");
+    assert_eq!(value, json!({"servers": []}));
+}
+
+#[test]
+fn explicitly_selected_missing_config_paths_are_errors() {
+    let temp = TempDir::new().expect("tempdir");
+    let missing_flag = temp.path().join("missing-flag.toml");
+    let missing_env = temp.path().join("missing-env.toml");
+
+    Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .arg("--config")
+        .arg(&missing_flag)
+        .args(["servers", "--json"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(format!(
+            "failed to read config `{}`",
+            missing_flag.display()
+        )));
+
+    Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env("CODEX_TAMER_CONFIG", &missing_env)
+        .env_remove("CODEX_TAMER_SERVER")
+        .args(["servers", "--json"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(format!(
+            "failed to read config `{}`",
+            missing_env.display()
+        )));
+}
+
+#[test]
 fn connect_ws_bypasses_config_and_lists_threads() {
     let server = TcpMockServer::start(None);
     let output = Command::cargo_bin("codex-tamer")
@@ -1425,6 +1620,675 @@ auth_token_env = "CODEX_TAMER_MISSING_TOKEN"
     assert_eq!(value["servers"][0]["alias"], "local");
     assert_eq!(value["servers"][1]["alias"], "remote");
     assert_eq!(value["servers"][1]["endpoint"], "ws://127.0.0.1:9/");
+}
+
+#[test]
+fn missing_config_reuses_the_codex_home_managed_listener() {
+    let server = MockServer::start_managed();
+
+    let listing = server
+        .managed_command()
+        .args(["servers", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listing: Value = serde_json::from_slice(&listing).expect("server listing");
+    assert_eq!(listing["servers"][0]["alias"], "managed");
+    assert_eq!(listing["servers"][0]["endpoint"], server.endpoint());
+    assert_eq!(listing["servers"][0]["managed"], true);
+
+    let threads = server
+        .managed_command()
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let threads: Value = serde_json::from_slice(&threads).expect("thread list");
+    assert_eq!(threads["server"], "managed");
+    assert_eq!(threads["threads"][0]["id"], "thread_1");
+
+    server
+        .managed_command()
+        .args(["list", "--server", "managed", "--json"])
+        .assert()
+        .success();
+
+    server
+        .managed_command()
+        .args(["servers", "ping", "--json"])
+        .assert()
+        .success();
+
+    let started = server
+        .managed_command()
+        .args(["servers", "start", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let started: Value = serde_json::from_slice(&started).expect("start report");
+    assert_eq!(started["server"], "managed");
+    assert_eq!(started["status"], "reused");
+    assert_eq!(started["backend"], "external");
+
+    let status = server
+        .managed_command()
+        .args(["servers", "status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).expect("status report");
+    assert_eq!(status["server"], "managed");
+    assert_eq!(status["running"], true);
+}
+
+#[test]
+fn managed_status_reports_stopped_only_for_an_absent_listener() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("tempdir");
+    let user_home = temp.path().join("home");
+    let codex_home = temp.path().join("codex-home");
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&user_home).expect("user home");
+    fs::create_dir(&codex_home).expect("codex home");
+    fs::create_dir(&runtime).expect("runtime");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("runtime mode");
+
+    let output = Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .env("HOME", &user_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["servers", "status", "--json"])
+        .assert()
+        .success()
+        .stderr(predicates::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    let output: Value = serde_json::from_slice(&output).expect("status json");
+
+    assert_eq!(output["status"], "stopped");
+    assert_eq!(output["running"], false);
+    assert!(output.get("error").is_none());
+}
+
+#[test]
+fn incompatible_existing_managed_listener_fails_without_invoking_codex() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start_managed_with_user_agent("codex_cli_rs/0.147.0 (test)");
+    let invoked = server._temp.path().join("codex-invoked");
+    let fake_codex = server._temp.path().join("codex");
+    fs::write(
+        &fake_codex,
+        format!(
+            "#!/bin/sh\nprintf 'invoked\\n' > '{}'\nexit 1\n",
+            invoked.display()
+        ),
+    )
+    .expect("fake codex");
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("fake codex mode");
+
+    server
+        .managed_command()
+        .args(["servers", "status", "--json"])
+        .assert()
+        .code(3)
+        .stdout(predicates::str::is_empty())
+        .stderr(predicates::str::contains(
+            "app-server version `0.147.0` is incompatible",
+        ));
+
+    server
+        .managed_command()
+        .arg("--codex")
+        .arg(&fake_codex)
+        .args(["servers", "start", "--json"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "app-server version `0.147.0` is incompatible",
+        ));
+
+    assert!(
+        !invoked.exists(),
+        "an incompatible reachable listener must not trigger Codex startup"
+    );
+}
+
+#[test]
+fn explicit_managed_target_with_configured_servers_keeps_managed_validation() {
+    let server = MockServer::start_managed_with_user_agent("codex_cli_rs/0.147.0 (test)");
+    fs::create_dir_all(server.config.parent().expect("config parent")).expect("config parent");
+    fs::write(
+        &server.config,
+        "[servers.work]\nendpoint = \"ws://127.0.0.1:9\"\n",
+    )
+    .expect("config");
+
+    server
+        .managed_command()
+        .args(["list", "--server", "managed", "--json"])
+        .assert()
+        .code(3)
+        .stdout(predicates::str::is_empty())
+        .stderr(predicates::str::contains(
+            "app-server version `0.147.0` is incompatible",
+        ));
+}
+
+#[test]
+fn malformed_reachable_managed_listener_fails_without_invoking_codex() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start_managed_with_initialize_override(
+        "codex_cli_rs/0.146.0 (test)",
+        Some(json!({"unexpected": true})),
+    );
+    let invoked = server._temp.path().join("codex-invoked");
+    let fake_codex = server._temp.path().join("codex");
+    fs::write(
+        &fake_codex,
+        format!(
+            "#!/bin/sh\nprintf 'invoked\\n' > '{}'\nexit 1\n",
+            invoked.display()
+        ),
+    )
+    .expect("fake codex");
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("fake codex mode");
+
+    server
+        .managed_command()
+        .args(["servers", "status", "--json"])
+        .assert()
+        .code(3)
+        .stdout(predicates::str::is_empty())
+        .stderr(predicates::str::contains(
+            "initialize response has an invalid result",
+        ));
+
+    server
+        .managed_command()
+        .arg("--codex")
+        .arg(&fake_codex)
+        .args(["servers", "start", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "initialize response has an invalid result",
+        ));
+
+    assert!(
+        !invoked.exists(),
+        "a reachable listener with a malformed handshake must not trigger Codex startup"
+    );
+}
+
+#[test]
+fn managed_commands_reject_an_insecure_runtime_tree_before_connecting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start_managed();
+    let managed_root = server
+        .managed_runtime
+        .as_ref()
+        .expect("managed runtime")
+        .join("codex-tamer");
+    fs::set_permissions(&managed_root, fs::Permissions::from_mode(0o755))
+        .expect("insecure managed root mode");
+
+    let list = server
+        .managed_command()
+        .args(["list", "--json"])
+        .output()
+        .expect("list output");
+    let status = server
+        .managed_command()
+        .args(["servers", "status", "--json"])
+        .output()
+        .expect("status output");
+    let stop = server
+        .managed_command()
+        .args(["servers", "stop", "--json"])
+        .output()
+        .expect("stop output");
+
+    assert!(!list.status.success());
+    assert!(
+        String::from_utf8_lossy(&list.stderr).contains("must be owned by uid"),
+        "list stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(!status.status.success());
+    assert!(status.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&status.stderr).contains("must be owned by uid"),
+        "status stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(!stop.status.success());
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("must be owned by uid"),
+        "stop stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+#[test]
+fn managed_discovery_ignores_a_stale_server_selection_environment_variable() {
+    let server = MockServer::start_managed();
+
+    let listing = server
+        .managed_command()
+        .env("CODEX_TAMER_SERVER", "stale")
+        .args(["servers", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listing: Value = serde_json::from_slice(&listing).expect("server listing");
+    assert_eq!(listing["servers"][0]["alias"], "managed");
+
+    let ping = server
+        .managed_command()
+        .env("CODEX_TAMER_SERVER", "stale")
+        .args(["servers", "ping", "--all", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ping: Value = serde_json::from_slice(&ping).expect("ping output");
+    assert_eq!(ping["servers"][0], json!({"server": "managed", "ok": true}));
+}
+
+#[test]
+fn process_record_failure_terminates_the_spawned_app_server() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("tempdir");
+    let codex_home = temp.path().join("codex-home");
+    let runtime = temp.path().join("runtime");
+    let user_home = temp.path().join("user-home");
+    fs::create_dir_all(&codex_home).expect("codex home");
+    fs::create_dir_all(&runtime).expect("runtime");
+    fs::create_dir_all(&user_home).expect("user home");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("runtime mode");
+    let codex_home = fs::canonicalize(codex_home).expect("canonical home");
+    let digest = blake3::hash(codex_home.as_os_str().as_encoded_bytes());
+    let managed_root = runtime.join("codex-tamer");
+    let socket_dir = managed_root.join(&digest.to_hex().as_str()[..24]);
+    fs::create_dir_all(&socket_dir).expect("managed socket directory");
+    fs::set_permissions(&managed_root, fs::Permissions::from_mode(0o700))
+        .expect("managed root mode");
+    fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700)).expect("socket dir mode");
+
+    let lock_path = socket_dir.join("start.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("lifecycle lock");
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).expect("lock mode");
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let pid_file = temp.path().join("spawned.pid");
+    let descendant_pid_file = temp.path().join("spawned-descendant.pid");
+    let fake_codex = temp.path().join("codex");
+    fs::write(
+        &fake_codex,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.146.0\n'
+  exit 0
+fi
+printf '%s' "$$" > '{}'
+/bin/sleep 3 &
+descendant=$!
+printf '%s' "$descendant" > '{}'
+exit 0
+"#,
+            pid_file.display(),
+            descendant_pid_file.display()
+        ),
+    )
+    .expect("fake codex");
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("fake codex mode");
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("codex-tamer"));
+    command
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .env("HOME", &user_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .arg("--codex")
+        .arg(&fake_codex)
+        .args(["servers", "start", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command.spawn().expect("codex-tamer process");
+    let record_temp = socket_dir.join(format!("process.{}.tmp", child.id()));
+    fs::create_dir(&record_temp).expect("blocking process record temporary path");
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+
+    let output = child.wait_with_output().expect("codex-tamer output");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to create process record"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_recorded_process_exited(&pid_file, "app-server launcher");
+    assert_recorded_process_exited(&descendant_pid_file, "app-server descendant");
+}
+
+fn process_exists(pid: libc::pid_t) -> bool {
+    let exists = unsafe { libc::kill(pid, 0) == 0 };
+    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn assert_recorded_process_exited(pid_file: &std::path::Path, label: &str) {
+    use std::time::{Duration, Instant};
+
+    let marker_deadline = Instant::now() + Duration::from_millis(500);
+    while !pid_file.exists() && Instant::now() < marker_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !pid_file.exists() {
+        return;
+    }
+    let pid: libc::pid_t = fs::read_to_string(pid_file)
+        .expect("spawned pid")
+        .parse()
+        .expect("numeric pid");
+    let exit_deadline = Instant::now() + Duration::from_millis(500);
+    while process_exists(pid) && Instant::now() < exit_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!process_exists(pid), "{label} pid {pid} survived cleanup");
+}
+
+#[test]
+fn missing_config_starts_the_selected_codex_listener_with_exact_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("tempdir");
+    let codex_home = temp.path().join("codex-home");
+    let runtime = temp.path().join("runtime");
+    let user_home = temp.path().join("user-home");
+    fs::create_dir_all(&codex_home).expect("codex home");
+    fs::create_dir_all(&runtime).expect("runtime");
+    fs::create_dir_all(&user_home).expect("user home");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("runtime mode");
+    let codex_home = fs::canonicalize(codex_home).expect("canonical home");
+    let digest = blake3::hash(codex_home.as_os_str().as_encoded_bytes());
+    let socket_dir = runtime
+        .join("codex-tamer")
+        .join(&digest.to_hex().as_str()[..24]);
+    let socket = socket_dir.join("app-server.sock");
+    let marker = temp.path().join("spawned.args");
+    let observed_home = temp.path().join("spawned.home");
+    let launcher_pid = temp.path().join("spawned.launcher.pid");
+    let descendant_pid = temp.path().join("spawned.descendant.pid");
+    let helper = std::env::current_exe().expect("test helper executable");
+    let fake_codex = temp.path().join("codex");
+    fs::write(
+        &fake_codex,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.146.0\n'
+  exit 0
+fi
+printf '%s\n' "$@" > '{}'
+printf '%s' "$CODEX_HOME" > '{}'
+printf '%s' "$$" > '{}'
+CODEX_TAMER_TEST_MANAGED_SOCKET='{}' \
+CODEX_TAMER_TEST_MANAGED_HOME="$CODEX_HOME" \
+  '{}' --exact managed_listener_process_helper --ignored --nocapture &
+(
+  trap 'sleep 1; exit 0' TERM INT HUP
+  while :; do sleep 10; done
+) &
+printf '%s' "$!" > '{}'
+sleep 0.3
+exit 0
+"#,
+            marker.display(),
+            observed_home.display(),
+            launcher_pid.display(),
+            socket.display(),
+            helper.display(),
+            descendant_pid.display()
+        ),
+    )
+    .expect("fake codex");
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("fake codex mode");
+
+    let output = Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .env("HOME", &user_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .arg("--codex")
+        .arg(&fake_codex)
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: Value = serde_json::from_slice(&output).expect("list output");
+    assert_eq!(output["server"], "managed");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("spawn args"),
+        format!("app-server\n--listen\nunix://{}\n", socket.display())
+    );
+    assert_eq!(
+        fs::read_to_string(&observed_home).expect("spawn home"),
+        codex_home.to_string_lossy()
+    );
+
+    let process_record = socket_dir.join("process.json");
+    assert!(process_record.exists());
+    assert_recorded_process_exited(&launcher_pid, "app-server launcher");
+    let status = Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .env("HOME", &user_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("TZ", "Pacific/Honolulu")
+        .env("PATH", "")
+        .args(["servers", "status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).expect("status report");
+    assert_eq!(status["backend"], "codex-tamer");
+    assert!(
+        process_record.exists(),
+        "status must not discard a live process record when TZ or PATH changes"
+    );
+
+    let stopped = Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .env("HOME", &user_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .arg("--codex")
+        .arg(&fake_codex)
+        .args(["servers", "stop", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stopped: Value = serde_json::from_slice(&stopped).expect("stop report");
+    assert_eq!(stopped["status"], "stopped");
+    assert_eq!(stopped["backend"], "codex-tamer");
+    assert_eq!(stopped["running"], false);
+    assert!(!process_record.exists());
+    assert_recorded_process_exited(&descendant_pid, "app-server descendant");
+}
+
+#[test]
+fn concurrent_first_start_spawns_one_listener_and_reuses_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("tempdir");
+    let codex_home = temp.path().join("codex-home");
+    let runtime = temp.path().join("runtime");
+    let user_home = temp.path().join("user-home");
+    fs::create_dir_all(&codex_home).expect("codex home");
+    fs::create_dir_all(&runtime).expect("runtime");
+    fs::create_dir_all(&user_home).expect("user home");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("runtime mode");
+    let codex_home = fs::canonicalize(codex_home).expect("canonical home");
+    let digest = blake3::hash(codex_home.as_os_str().as_encoded_bytes());
+    let socket_dir = runtime
+        .join("codex-tamer")
+        .join(&digest.to_hex().as_str()[..24]);
+    let socket = socket_dir.join("app-server.sock");
+    let launches = temp.path().join("launches.log");
+    let helper = std::env::current_exe().expect("test helper executable");
+    let fake_codex = temp.path().join("codex");
+    fs::write(
+        &fake_codex,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.146.0\n'
+  exit 0
+fi
+printf 'launch\n' >> '{}'
+CODEX_TAMER_TEST_MANAGED_SOCKET='{}' \
+CODEX_TAMER_TEST_MANAGED_HOME="$CODEX_HOME" \
+  exec '{}' --exact managed_listener_process_helper --ignored --nocapture
+"#,
+            launches.display(),
+            socket.display(),
+            helper.display()
+        ),
+    )
+    .expect("fake codex");
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("fake codex mode");
+
+    let command = || {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("codex-tamer"));
+        command
+            .env_remove("CODEX_TAMER_CONFIG")
+            .env_remove("CODEX_TAMER_SERVER")
+            .env("HOME", &user_home)
+            .env("CODEX_HOME", &codex_home)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .arg("--codex")
+            .arg(&fake_codex)
+            .args(["list", "--json"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    };
+    let first = command().spawn().expect("first codex-tamer");
+    let second = command().spawn().expect("second codex-tamer");
+    let first = first.wait_with_output().expect("first output");
+    let second = second.wait_with_output().expect("second output");
+
+    let stop = Command::cargo_bin("codex-tamer")
+        .expect("binary")
+        .env_remove("CODEX_TAMER_CONFIG")
+        .env_remove("CODEX_TAMER_SERVER")
+        .env("HOME", &user_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .arg("--codex")
+        .arg(&fake_codex)
+        .args(["servers", "stop", "--json"])
+        .assert()
+        .success();
+    drop(stop);
+
+    assert!(
+        first.status.success(),
+        "first stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "second stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&launches)
+            .expect("launch count")
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!socket_dir.join("process.json").exists());
+}
+
+#[test]
+fn servers_stop_refuses_a_reachable_external_listener_without_a_process_record() {
+    let server = MockServer::start_managed();
+
+    server
+        .managed_command()
+        .args(["servers", "stop", "--json"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "reachable but is not owned by codex-tamer; refusing to stop it",
+        ));
+
+    server
+        .managed_command()
+        .args(["list", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn servers_stop_rejects_a_malformed_reachable_listener_without_a_process_record() {
+    let server = MockServer::start_managed_with_initialize_override(
+        "codex_cli_rs/0.146.0 (test)",
+        Some(json!({"unexpected": true})),
+    );
+
+    server
+        .managed_command()
+        .args(["servers", "stop", "--json"])
+        .assert()
+        .code(3)
+        .stdout(predicates::str::is_empty())
+        .stderr(predicates::str::contains(
+            "endpoint is reachable but cannot be verified for shutdown",
+        ));
 }
 
 #[test]
@@ -4477,17 +5341,16 @@ fn control_and_goal_commands_return_acknowledgements() {
 }
 
 #[test]
-fn steer_resumes_not_loaded_thread_before_retrying_turn_steer() {
+fn steer_never_resumes_a_thread_that_is_not_loaded_on_the_target_runtime() {
     let server = MockServer::start_requiring_resume_for_steer();
-    let accepted = run_json(
-        &server,
-        &[
+    server
+        .command()
+        .args([
             "steer", "--server", "work", "--json", "thread_1", "turn_1", "adjust",
-        ],
-    );
-    assert_eq!(accepted["status"], "accepted");
-    assert_eq!(accepted["threadId"], "thread_1");
-    assert_eq!(accepted["turnId"], "turn_1");
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains("thread not found"));
 
     let methods = server.methods();
     let retry_methods = methods
@@ -4495,11 +5358,8 @@ fn steer_resumes_not_loaded_thread_before_retrying_turn_steer() {
         .filter(|method| matches!(method.as_str(), "turn/steer" | "thread/resume"))
         .map(String::as_str)
         .collect::<Vec<_>>();
-    assert_eq!(retry_methods, ["turn/steer", "thread/resume", "turn/steer"]);
-
-    let thread_resume_params = server.params_for("thread/resume");
-    assert_eq!(thread_resume_params.len(), 1);
-    assert_thread_yolo_params(&thread_resume_params[0]);
+    assert_eq!(retry_methods, ["turn/steer"]);
+    assert!(server.params_for("thread/resume").is_empty());
 }
 
 #[test]

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 #[cfg(unix)]
@@ -20,7 +21,7 @@ use crate::config::Endpoint;
 
 #[cfg(unix)]
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 
@@ -54,15 +55,35 @@ pub struct RpcClient {
     stream: RpcStream,
     next_id: i64,
     connection_id: u64,
+    server_info: Option<InitializeInfo>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    peer_identity: Option<PeerIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerIdentity {
+    pub pid: Option<u32>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InitializeInfo {
+    pub user_agent: String,
+    pub codex_home: std::path::PathBuf,
+    pub platform_family: String,
+    pub platform_os: String,
 }
 
 impl RpcClient {
     pub async fn connect(endpoint: &Endpoint) -> Result<Self> {
-        let stream = match endpoint {
+        let (stream, peer_identity) = match endpoint {
             Endpoint::Unix { path } => {
                 #[cfg(unix)]
                 {
-                    RpcStream::Unix(connect_unix(path).await?)
+                    let (stream, peer_identity) = connect_unix(path).await?;
+                    (RpcStream::Unix(stream), Some(peer_identity))
                 }
                 #[cfg(not(unix))]
                 {
@@ -72,9 +93,10 @@ impl RpcClient {
                     ));
                 }
             }
-            Endpoint::WebSocket { url, auth_token } => {
-                RpcStream::Tcp(connect_websocket(url, auth_token.as_deref()).await?)
-            }
+            Endpoint::WebSocket { url, auth_token } => (
+                RpcStream::Tcp(connect_websocket(url, auth_token.as_deref()).await?),
+                None,
+            ),
         };
         let connection_id = crate::debuglog::next_connection_id();
         if crate::debuglog::enabled() {
@@ -92,9 +114,22 @@ impl RpcClient {
             stream,
             next_id: 1,
             connection_id,
+            server_info: None,
+            peer_identity,
         };
-        client.initialize().await?;
+        client.server_info = Some(client.initialize().await?);
         Ok(client)
+    }
+
+    pub fn server_info(&self) -> &InitializeInfo {
+        self.server_info
+            .as_ref()
+            .expect("RpcClient is initialized before use")
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn peer_identity(&self) -> Option<PeerIdentity> {
+        self.peer_identity
     }
 
     async fn send_message(
@@ -160,7 +195,9 @@ impl RpcStream {
 }
 
 #[cfg(unix)]
-async fn connect_unix(path: &std::path::Path) -> Result<WebSocketStream<UnixStream>> {
+async fn connect_unix(
+    path: &std::path::Path,
+) -> Result<(WebSocketStream<UnixStream>, PeerIdentity)> {
     let request = HANDSHAKE_URL
         .into_client_request()
         .context("invalid UDS websocket handshake URL")?;
@@ -168,6 +205,18 @@ async fn connect_unix(path: &std::path::Path) -> Result<WebSocketStream<UnixStre
         .await
         .context("timed out connecting to app-server UDS")?
         .with_context(|| format!("failed to connect to app-server UDS `{}`", path.display()))?;
+    let credentials = unix
+        .peer_cred()
+        .with_context(|| format!("failed to inspect app-server UDS peer `{}`", path.display()))?;
+    let peer_identity = PeerIdentity {
+        pid: credentials
+            .pid()
+            .map(u32::try_from)
+            .transpose()
+            .context("app-server UDS peer pid is invalid")?,
+        uid: credentials.uid(),
+        gid: credentials.gid(),
+    };
     let (stream, _) = tokio::time::timeout(
         CONNECT_TIMEOUT,
         client_async_with_config(request, unix, Some(websocket_config())),
@@ -175,7 +224,7 @@ async fn connect_unix(path: &std::path::Path) -> Result<WebSocketStream<UnixStre
     .await
     .context("timed out upgrading UDS connection to websocket")?
     .context("failed to upgrade UDS connection to websocket")?;
-    Ok(stream)
+    Ok((stream, peer_identity))
 }
 
 async fn connect_websocket(
@@ -214,7 +263,7 @@ fn websocket_config() -> WebSocketConfig {
 }
 
 impl RpcClient {
-    async fn initialize(&mut self) -> Result<()> {
+    async fn initialize(&mut self) -> Result<InitializeInfo> {
         let result = self
             .request(
                 "initialize",
@@ -231,9 +280,19 @@ impl RpcClient {
                 |_| {},
             )
             .await?;
-        let _ = result;
+        let info: InitializeInfo =
+            serde_json::from_value(result).context("initialize response has an invalid result")?;
+        if info.user_agent.trim().is_empty()
+            || info.platform_family.trim().is_empty()
+            || info.platform_os.trim().is_empty()
+            || !info.codex_home.is_absolute()
+        {
+            return Err(anyhow!(
+                "initialize response has invalid server identity fields"
+            ));
+        }
         self.send_notification("initialized", Value::Null).await?;
-        Ok(())
+        Ok(info)
     }
 
     pub async fn send_notification(&mut self, method: &str, params: Value) -> Result<()> {
@@ -400,6 +459,11 @@ mod tests {
     use tokio_tungstenite::accept_async;
 
     #[test]
+    fn ordinary_request_read_timeout_is_two_minutes() {
+        assert_eq!(REQUEST_READ_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
     fn response_parser_requires_exactly_one_payload() {
         assert!(
             parse_response_for_id(&json!({"id": 2, "result": null}), 1)
@@ -449,9 +513,14 @@ mod tests {
             assert_eq!(initialize["method"], "initialize");
             websocket
                 .send(Message::Text(
-                    json!({"id": initialize["id"], "result": {}})
-                        .to_string()
-                        .into(),
+                    json!({"id": initialize["id"], "result": {
+                        "userAgent": "codex_cli_rs/0.146.0 (test)",
+                        "codexHome": "/tmp/mock-codex",
+                        "platformFamily": "unix",
+                        "platformOs": "linux"
+                    }})
+                    .to_string()
+                    .into(),
                 ))
                 .await
                 .unwrap();

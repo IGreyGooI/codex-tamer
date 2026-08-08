@@ -16,8 +16,9 @@ use crate::completion::{
     completion_candidates, completion_instructions, completion_script, normalize_shell,
 };
 use crate::config::{
-    AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
-    resolve_config_path, resolve_direct_target, resolve_target,
+    AppConfig, MANAGED_SERVER_ALIAS, Target, is_valid_reasoning_effort, legacy_server_warnings,
+    load_config_or_default, resolve_config_path, resolve_direct_target, resolve_managed_target,
+    resolve_target,
 };
 use crate::errors::{ExitError, app_server_error, usage_error};
 use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
@@ -92,10 +93,25 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 
     let config_path = resolve_config_path(cli.config.clone());
+    let config_is_explicit =
+        cli.config.is_some() || std::env::var_os("CODEX_TAMER_CONFIG").is_some();
     let yolo = !cli.no_yolo;
+    let mut config = if cli.connect.is_some() {
+        AppConfig::default()
+    } else {
+        let config = load_config_or_default(&config_path, config_is_explicit)?;
+        print_legacy_warnings(&config);
+        config
+    };
+    if let Some(codex) = cli.codex {
+        config.managed.codex = Some(codex);
+    }
+    if let Some(codex_home) = cli.codex_home {
+        config.managed.codex_home = Some(codex_home);
+    }
     if let Command::Servers(command) = &cli.command {
         return servers_command(
-            &config_path,
+            &config,
             cli.connect.as_deref(),
             cli.connect_auth_token_env.as_deref(),
             cli.connect_auth_token.as_deref(),
@@ -103,13 +119,6 @@ async fn run(cli: Cli) -> Result<i32> {
         )
         .await;
     }
-    let config = if cli.connect.is_some() {
-        AppConfig::default()
-    } else {
-        let config = load_config(&config_path)?;
-        print_legacy_warnings(&config);
-        config
-    };
     match cli.command {
         Command::Servers(_) => unreachable!(),
         Command::List(command) => {
@@ -386,7 +395,7 @@ async fn run(cli: Cli) -> Result<i32> {
             {
                 return Err(usage_error("rate-limit reset redemption is not permitted"));
             }
-            let client = RpcClient::connect(&target.endpoint).await?;
+            let client = connect_target(&config, &target, true).await?;
             usage_command(target, client, command, rate_limit_reset_allowed).await
         }
         Command::Goal(command) => match command.command {
@@ -534,24 +543,41 @@ where
         connect_auth_token,
         server,
     )?;
-    let client = RpcClient::connect(&target.endpoint).await?;
+    let client = connect_target(config, &target, true).await?;
     f(target, client).await
 }
 
+fn is_managed_target(target: &Target) -> bool {
+    target.server == MANAGED_SERVER_ALIAS
+}
+
+async fn connect_target(
+    config: &AppConfig,
+    target: &Target,
+    start_managed: bool,
+) -> Result<RpcClient> {
+    if is_managed_target(target) {
+        if start_managed {
+            return Ok(
+                crate::managed_server::connect_or_start(config, &target.endpoint)
+                    .await?
+                    .0,
+            );
+        }
+        return Ok(crate::managed_server::probe(config, &target.endpoint)
+            .await?
+            .0);
+    }
+    RpcClient::connect(&target.endpoint).await
+}
+
 async fn servers_command(
-    config_path: &std::path::Path,
+    config: &AppConfig,
     connect: Option<&str>,
     connect_auth_token_env: Option<&str>,
     connect_auth_token: Option<&str>,
     command: &ServersCommand,
 ) -> Result<i32> {
-    let config = if connect.is_some() {
-        AppConfig::default()
-    } else {
-        let config = load_config(config_path)?;
-        print_legacy_warnings(&config);
-        config
-    };
     match &command.command {
         None => {
             if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
@@ -559,14 +585,23 @@ async fn servers_command(
                     "--connect-auth-token and --connect-auth-token-env are not valid for servers listing",
                 ));
             }
-            let rows: Vec<_> = config
-                .servers
-                .iter()
-                .map(|(alias, server)| {
-                    let endpoint = server.endpoint_display(alias)?;
-                    Ok(json!({"alias": alias, "endpoint": endpoint}))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let rows: Vec<_> = if connect.is_some() {
+                Vec::new()
+            } else if config.servers.is_empty() {
+                let target = resolve_managed_target(config)?;
+                vec![
+                    json!({"alias": target.server, "endpoint": target.endpoint.display(), "managed": true}),
+                ]
+            } else {
+                config
+                    .servers
+                    .iter()
+                    .map(|(alias, server)| {
+                        let endpoint = server.endpoint_display(alias)?;
+                        Ok(json!({"alias": alias, "endpoint": endpoint}))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
             if command.json {
                 print_json(&json!({ "servers": rows }))?;
             } else {
@@ -599,8 +634,16 @@ async fn servers_command(
             }
             if ping.all {
                 let mut results = Vec::new();
+                if config.servers.is_empty() {
+                    let target = resolve_managed_target(config)?;
+                    let ok = connect_target(config, &target, false).await.is_ok();
+                    return render_server_ping_results(
+                        vec![json!({"server": target.server, "ok": ok})],
+                        ping.json,
+                    );
+                }
                 for (server, cfg) in &config.servers {
-                    let ok = match Target::configured(server, cfg, &config) {
+                    let ok = match Target::configured(server, cfg, config) {
                         Ok(target) => RpcClient::connect(&target.endpoint).await.is_ok(),
                         Err(_) => false,
                     };
@@ -618,18 +661,92 @@ async fn servers_command(
                             "--connect-auth-token and --connect-auth-token-env require --connect",
                         ));
                     }
-                    resolve_target(&config, ping.server.as_deref())?
+                    resolve_target(config, ping.server.as_deref())?
                 };
                 vec![target]
             };
             let mut results = Vec::new();
             for target in targets {
-                let ok = RpcClient::connect(&target.endpoint).await.is_ok();
+                let ok = connect_target(config, &target, false).await.is_ok();
                 results.push(json!({"server": target.server, "ok": ok}));
             }
             render_server_ping_results(results, ping.json)
         }
+        Some(ServersSubcommand::Start(start)) => {
+            reject_connect_for_managed_lifecycle(
+                connect,
+                connect_auth_token_env,
+                connect_auth_token,
+            )?;
+            let target = resolve_managed_target(config)?;
+            let (_, report) =
+                crate::managed_server::connect_or_start(config, &target.endpoint).await?;
+            render_managed_server_report(&target, report, true, start.json)
+        }
+        Some(ServersSubcommand::Status(status)) => {
+            reject_connect_for_managed_lifecycle(
+                connect,
+                connect_auth_token_env,
+                connect_auth_token,
+            )?;
+            let target = resolve_managed_target(config)?;
+            match crate::managed_server::probe_optional(config, &target.endpoint).await {
+                Ok(Some((_, report))) => {
+                    render_managed_server_report(&target, report, true, status.json)
+                }
+                Ok(None) => {
+                    let output = json!({
+                        "server": target.server,
+                        "status": "stopped",
+                        "running": false,
+                        "endpoint": target.endpoint.display()
+                    });
+                    emit_json_or_status(status.json, &output)
+                }
+                Err(err) => Err(app_server_error(format!(
+                    "managed app-server status failed: {err:#}"
+                ))),
+            }
+        }
+        Some(ServersSubcommand::Stop(stop)) => {
+            reject_connect_for_managed_lifecycle(
+                connect,
+                connect_auth_token_env,
+                connect_auth_token,
+            )?;
+            let target = resolve_managed_target(config)?;
+            let report = crate::managed_server::stop(config, &target.endpoint).await?;
+            render_managed_server_report(&target, report, false, stop.json)
+        }
     }
+}
+
+fn reject_connect_for_managed_lifecycle(
+    connect: Option<&str>,
+    connect_auth_token_env: Option<&str>,
+    connect_auth_token: Option<&str>,
+) -> Result<()> {
+    if connect.is_some() || connect_auth_token_env.is_some() || connect_auth_token.is_some() {
+        return Err(usage_error(
+            "--connect and its auth options cannot be used with managed server lifecycle commands",
+        ));
+    }
+    Ok(())
+}
+
+fn render_managed_server_report(
+    target: &Target,
+    report: crate::managed_server::ManagedServerReport,
+    running: bool,
+    json_output: bool,
+) -> Result<i32> {
+    let mut output = serde_json::to_value(report)?;
+    let object = output
+        .as_object_mut()
+        .expect("managed server report serializes as an object");
+    object.insert("server".to_string(), json!(target.server));
+    object.insert("running".to_string(), json!(running));
+    emit_json_or_status(json_output, &output)
 }
 
 fn render_server_ping_results(results: Vec<Value>, json_output: bool) -> Result<i32> {

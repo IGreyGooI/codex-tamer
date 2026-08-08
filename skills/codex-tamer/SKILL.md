@@ -1,6 +1,6 @@
 ---
 name: codex-tamer
-description: Use the headless `codex-tamer` CLI as an Agent-facing frontend to Codex app-server. Invoke it to discover and inspect Codex threads, read history and status, create or fork threads, send or steer messages, wait for or follow active turns, fetch results, inject raw history items, interrupt turns, and manage thread metadata through machine-readable JSON or NDJSON on configured Unix-socket or WebSocket endpoints.
+description: Use the headless `codex-tamer` CLI as an Agent-facing frontend to Codex app-server. Invoke it to automatically reuse or start a shared Unix listener for CODEX_HOME, connect to explicit Unix-socket or WebSocket endpoints, handle VS Code stdio attachment limits, discover and inspect Codex threads, read history and status, create or fork threads, send or steer messages, wait for or follow active turns, fetch results, inject raw history items, interrupt turns, and manage thread metadata through machine-readable JSON or NDJSON.
 metadata:
   requires:
     bins: ["codex-tamer"]
@@ -18,33 +18,96 @@ Use the CLI as a headless machine interface. Do not look for or claim a
 
 ## Establish the Target
 
-Prefer the user's existing config at:
+Resolve one endpoint in this order:
 
-```text
-~/.config/codex-tamer/config.toml
-```
+1. `--connect ENDPOINT`
+2. `--server ALIAS`
+3. `CODEX_TAMER_SERVER`
+4. The only server in `~/.config/codex-tamer/config.toml`
+5. On Unix, the shared listener derived from the canonical `CODEX_HOME`
 
 Resolve the target with `--server ALIAS` when several servers are configured.
 Use `--connect ENDPOINT` only for explicit one-off targeting or debugging. Do
 not combine `--connect` with `--server` or `CODEX_TAMER_SERVER`.
 
-Verify uncertain connectivity before doing other work:
+An absent default config is valid. Ordinary commands automatically reuse or
+start the inferred Unix listener. Use lifecycle commands when setup or
+diagnostics are the task:
 
 ```bash
+codex-tamer servers start --json
+codex-tamer servers status --json
 codex-tamer servers ping --json
+codex-tamer servers stop --json
 ```
 
-If the result is empty or unreachable, verify that Codex app-server is running
-and that relevant Codex sessions use the same endpoint. A typical setup is:
+`servers ping` and `servers status` only probe; they do not start a stopped
+listener. Treat `status = "stopped"` as a confirmed absent listener; an
+incompatible, malformed, or insecure target exits `3` instead. `servers stop`
+only stops a process recorded as started by `codex-tamer` and must refuse a
+reachable external listener.
+
+The default socket is stable for one canonical home:
+
+```text
+$XDG_RUNTIME_DIR/codex-tamer/<24-char CODEX_HOME hash>/app-server.sock
+```
+
+When `XDG_RUNTIME_DIR` is unset, use
+`/tmp/codex-tamer-<UID>/<24-char CODEX_HOME hash>/app-server.sock` to stay within
+macOS Unix-socket path limits. Pass `--server managed` to select this synthetic
+target explicitly. Treat `managed` as reserved; do not declare it under
+`[servers]`.
+
+Require the runtime directories and listener peer to belong to the current UID;
+require directory mode `0700`. Do not move the socket into a WSL DrvFS
+`CODEX_HOME`, relax directory permissions, or fall back to TCP. `codex-tamer`
+does not write a config file.
+
+Resolve startup inputs in these orders:
+
+- Home: `--codex-home` > `[managed].codex_home` > `CODEX_HOME` > `~/.codex`
+- Binary: `--codex` > `[managed].codex` >
+  `CODEX_HOME/packages/standalone/current/codex` > `codex` on `PATH`
+
+Require exact reviewed Codex `0.146.0`. Validate both the selected binary and
+the connected server's initialize `userAgent` and `codexHome`; never silently
+fall back after an explicit binary is rejected. Do not run
+`codex app-server daemon bootstrap`; it installs a detached hourly updater.
+
+Use an explicit target when the user selected another listener:
 
 ```bash
-CODEX_ENDPOINT=unix:///path/to/codex.sock
+CODEX_ENDPOINT=unix:///absolute/private/path/codex.sock
 codex app-server --listen "$CODEX_ENDPOINT"
+codex-tamer --connect "$CODEX_ENDPOINT" servers ping --json
 codex --remote "$CODEX_ENDPOINT" --cd "$PWD"
 ```
 
+Treat `CODEX_ENDPOINT` as a shell variable that keeps these example commands
+consistent, not as a `codex-tamer` target source. Pass it through
+`--connect "$CODEX_ENDPOINT"` or store the endpoint in the config file.
+
+The official VS Code Codex 0.146 integration starts a private stdio-only
+app-server and exposes no listener setting. `codex-tamer` cannot attach after
+that stdio session has started, steer its active turn, or inject into it. Do not
+start another server and claim that it controls that live runtime.
+
+The shared app-server still reads the same `CODEX_HOME` state database and
+scans session JSONL to repair persisted metadata. This makes persisted threads
+discoverable; it does not transfer live ownership from a private stdio process.
+Only clients connected to the same explicit endpoint share loaded-thread and
+active-turn state. Use `codex --remote` for future live-controllable sessions.
+
+On Windows, automatic Unix startup is unsupported. Require a configured
+`ws://` or `wss://` endpoint; do not offer a Unix command as recovery.
+
 Remember that `codex-tamer` requests the Codex experimental API capability.
 Treat an `experimentalApi` capability error as a server compatibility problem.
+
+Top-level and per-server `model` and `model_reasoning_effort` are defaults for
+new threads or turns. They do not configure, select, start, or identify the
+app-server.
 
 ## Apply the Safety Boundary
 
@@ -89,6 +152,10 @@ envelope. On codes `2`, `3`, and `130`, inspect stderr. During NDJSON streaming,
 retain already-received records but do not assume success until the process
 exits `0`.
 
+Allow up to 120 seconds without an app-server message for every ordinary
+JSON-RPC request. Treat turn command `--timeout` values as separate operation
+deadlines rather than overrides for this transport wait.
+
 ## Follow the Agent Workflow
 
 1. Discover candidate threads with JSON.
@@ -100,11 +167,17 @@ exits `0`.
 
 ### Discover Threads
 
-List recent work:
+List recent work. Pair `--since` with updated-descending order so the scan can
+stop once it reaches older threads:
 
 ```bash
-codex-tamer list --since 24h --limit 50 --json
+codex-tamer list --since 24h --limit 50 --sort updated --desc --json
 ```
+
+Without `--sort updated --desc`, a `--since` query must scan every server page
+to avoid missing recent threads in server-defined order. `--limit` caps the
+returned matches, not the amount of persisted history scanned. This can be
+slow for large `CODEX_HOME` session stores, especially across WSL DrvFS.
 
 Search metadata and previews:
 
@@ -115,7 +188,7 @@ codex-tamer search threads "release process" --limit 20 --json
 Project compact fields only when useful:
 
 ```bash
-codex-tamer list --since 24h --limit 50 --json \
+codex-tamer list --since 24h --limit 50 --sort updated --desc --json \
   | jq '{threads:[.threads[] | {id,name,cwd,status:.status.type,updatedAt,preview}]}'
 ```
 
@@ -269,6 +342,12 @@ status=$(codex-tamer status THREAD_ID --json)
 active_turn=$(printf '%s\n' "$status" | jq -r '.activeTurnId // empty')
 codex-tamer steer THREAD_ID "$active_turn" "Prioritize the failing test" --json
 ```
+
+`steer` never resumes an unloaded persisted thread. If the selected endpoint
+does not own that active turn, report the runtime boundary instead of treating a
+newly resumed snapshot as the original live session. `send`, `settings set`,
+and `inject` may resume persisted state; use them only when another runtime is
+not actively writing the same thread.
 
 Interrupt explicitly:
 

@@ -655,6 +655,31 @@ where
     .await
 }
 
+pub async fn request_direct_input_without_resume<F>(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    thread_id: &str,
+    mut on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
+    let read = client
+        .request(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+            |_| {},
+        )
+        .await?;
+    ensure_direct_input_allowed(&read, thread_id)?;
+    client
+        .request(method, params, |notification| {
+            on_notification(notification);
+        })
+        .await
+}
+
 async fn request_with_resume_retry_inner<F>(
     client: &mut RpcClient,
     method: &str,

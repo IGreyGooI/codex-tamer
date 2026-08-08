@@ -3,6 +3,12 @@
 model = "gpt-5.5"
 model_reasoning_effort = "high"
 
+# Optional Unix managed-listener overrides. Without configured servers,
+# codex-tamer serves CODEX_HOME (or ~/.codex) through one private shared socket.
+# [managed]
+# codex = "/absolute/path/to/codex"
+# codex_home = "/absolute/path/to/.codex"
+
 [servers.main]
 endpoint = "unix:///path/to/codex.sock"
 

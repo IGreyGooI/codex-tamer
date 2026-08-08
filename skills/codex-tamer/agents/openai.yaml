@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Tamer"
-  short_description: "Control Codex threads from another Agent"
-  default_prompt: "Use $codex-tamer to inspect active Codex threads and safely continue the relevant one."
+  short_description: "Share and control Codex app-server threads"
+  default_prompt: "Use $codex-tamer to reuse or start the shared Codex app-server, then inspect and safely control the relevant thread."

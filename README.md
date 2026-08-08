@@ -33,6 +33,8 @@ schedule Agents, parse rollout files, or maintain a competing thread store.
 ## Capabilities
 
 - Select one named Codex app-server endpoint per command.
+- On Unix, reuse or start one private shared app-server for the selected
+  `CODEX_HOME` when no endpoint is configured explicitly.
 - List, search, inspect, and page Codex threads and turn history.
 - Read flattened user and assistant messages.
 - Create and fork threads.
@@ -87,8 +89,11 @@ can change, and commands that rely on unsupported methods fail normally.
 
 ## Prerequisites
 
-- A separate Codex CLI/runtime installation with `codex` on `PATH`.
-- A long-lived Codex app-server listening on a Unix socket or WebSocket.
+- The exact reviewed Codex CLI/runtime release, `0.146.0`, either in the
+  selected `CODEX_HOME` standalone install, on `PATH`, or selected with
+  `--codex PATH`.
+- On Windows, an explicitly configured `ws://` or `wss://` app-server. Unix
+  builds can manage a private local Unix listener automatically.
 - Node.js 20 or newer to run the release-bundle installer.
 - Linux release bundles require glibc 2.34 or newer and the OpenSSL 3 shared
   libraries (`libssl.so.3` and `libcrypto.so.3`); the release workflow checks
@@ -96,23 +101,27 @@ can change, and commands that rely on unsupported methods fail normally.
 - Rust only when developing or building a release bundle.
 - `jq` only for the optional projection examples below.
 
-`codex-tamer` only sees threads served by the app-server it connects to. An
-empty list usually means the expected sessions are attached to another server.
+Codex app-server reads the selected `CODEX_HOME` state database and scans its
+session JSONL when listing threads, repairing persisted metadata as needed.
+Sharing a `CODEX_HOME` therefore makes persisted threads discoverable, but it
+does not make a private stdio process remotely controllable.
 
 ## Install
 
 Release archives contain a prebuilt platform binary, the Agent Skill,
-`manifest.json`, and `install.mjs`. Recipients do not need Rust or the source
-checkout. For the private repository, authenticate `gh` before downloading a
-release asset:
+`manifest.json`, and `install.mjs`. Recipients do not need Rust, GitHub
+authentication, or the source checkout. Download the archive and adjacent
+checksum from the public release:
 
 ```bash
-gh auth status --hostname github.com
-gh release download TAG --repo IGreyGooI/codex-tamer \
-  --pattern 'codex-tamer-*-linux-x86_64.tar.gz*'
-sha256sum -c codex-tamer-*-linux-x86_64.tar.gz.sha256
-tar -xzf codex-tamer-*-linux-x86_64.tar.gz
-cd codex-tamer-*-linux-x86_64
+VERSION=0.3.0
+ASSET="codex-tamer-${VERSION}-linux-x86_64.tar.gz"
+BASE="https://github.com/IGreyGooI/codex-tamer/releases/download/v${VERSION}"
+curl --fail --location --remote-name "${BASE}/${ASSET}"
+curl --fail --location --remote-name "${BASE}/${ASSET}.sha256"
+sha256sum -c "${ASSET}.sha256"
+tar -xzf "$ASSET"
+cd "codex-tamer-${VERSION}-linux-x86_64"
 node install.mjs --json
 codex-tamer --version
 ```
@@ -170,37 +179,103 @@ CODEX_TAMER_RELEASE_REMOTE=upstream node scripts/release.mjs patch
 The local script creates and pushes the release commit and tag; it leaves
 GitHub Release creation to the tag workflow.
 
-## Start Codex App-Server
+## Shared App-Server
 
-Start a shared local server:
+On Unix, an absent default config is valid. When no explicit or configured
+server wins target selection, ordinary commands reuse or start one shared Codex
+app-server for the canonical `CODEX_HOME`:
 
 ```bash
-CODEX_ENDPOINT=unix:///path/to/codex.sock
+codex-tamer list --json
+```
+
+The endpoint is stable for that home:
+
+```text
+$XDG_RUNTIME_DIR/codex-tamer/<CODEX_HOME-hash>/app-server.sock
+```
+
+If `XDG_RUNTIME_DIR` is unset, the short UID-specific runtime root
+`/tmp/codex-tamer-<UID>` is used so the final socket remains within macOS path
+limits. Pass `--server managed` to select this synthetic target explicitly.
+The alias `managed` is reserved and cannot be declared under `[servers]`. The
+runtime directories and connected listener peer must belong to the current UID;
+the directories use mode `0700`.
+`codex-tamer` refuses an unsafe directory rather than placing the control socket
+inside a permission-inaccurate WSL DrvFS `CODEX_HOME` or falling back to TCP.
+It does not create a config file or run `codex app-server daemon bootstrap`.
+
+Manage the inferred listener explicitly when needed:
+
+```bash
+codex-tamer servers start --json
+codex-tamer servers status --json
+codex-tamer servers stop --json
+```
+
+`servers ping` and `servers status` are probes and never start a stopped
+listener. `servers status` reports `stopped` only when no listener accepts a
+connection; an incompatible, malformed, or insecure managed target exits `3`
+with diagnostics on stderr. `servers stop` only terminates a process group
+whose schema-versioned record, system boot identity, launcher identity, home,
+endpoint, and Unix peer credentials prove `codex-tamer` ownership; it refuses a
+reachable external listener.
+
+The managed home resolves in this order:
+
+1. `--codex-home PATH`
+2. `[managed].codex_home`
+3. `CODEX_HOME`
+4. `~/.codex`
+
+The executable resolves independently:
+
+1. `--codex PATH`
+2. `[managed].codex`
+3. `CODEX_HOME/packages/standalone/current/codex`
+4. `codex` on `PATH`
+
+The selected executable and the listener's initialize identity must both match
+the exact reviewed Codex version and canonical home. No fallback occurs after
+an explicit executable is rejected.
+
+To use a separate listener, configure it or pass it directly:
+
+```bash
+CODEX_ENDPOINT=unix:///absolute/private/path/codex.sock
 codex app-server --listen "$CODEX_ENDPOINT"
-```
-
-Interactive Codex sessions that should be visible to `codex-tamer` must use the
-same server:
-
-```bash
-codex --remote "$CODEX_ENDPOINT" --cd "$PWD"
-```
-
-A direct endpoint is useful for a one-off check:
-
-```bash
 codex-tamer --connect "$CODEX_ENDPOINT" servers ping --json
+codex --remote "$CODEX_ENDPOINT" --cd /absolute/worktree
 ```
+
+`CODEX_ENDPOINT` above is only a shell variable shared by the commands;
+`codex-tamer` does not read it automatically.
+
+The official VS Code Codex 0.146 integration starts a private stdio app-server
+and exposes no setting for redirecting it to this listener. `codex-tamer`
+cannot attach to that process after start or inject into its active turn. The
+shared app-server can still discover persisted threads from the same
+`CODEX_HOME`, but only clients connected to the same explicit endpoint share
+live loaded-thread state. Use `codex --remote` for future sessions that must be
+live-controllable by `codex-tamer`.
 
 ## Configure Targets
 
-The default config path is:
+The optional default config path is:
 
 ```text
 ~/.config/codex-tamer/config.toml
 ```
 
-Configure one server to make it the implicit target:
+Configure managed startup overrides without defining a server:
+
+```toml
+[managed]
+codex = "/absolute/path/to/codex"
+codex_home = "/absolute/path/to/.codex"
+```
+
+Configure one external server to make it the implicit target instead:
 
 ```toml
 model = "gpt-5.5"
@@ -231,7 +306,8 @@ Target resolution is deterministic:
 2. Command `--server ALIAS` selects a configured server.
 3. `CODEX_TAMER_SERVER` selects a configured server.
 4. A config containing exactly one server selects it automatically.
-5. Otherwise the command exits with code `2` and requires an explicit target.
+5. With no configured servers, Unix uses the managed `CODEX_HOME` listener.
+6. Several configured servers without a selection exit with code `2`.
 
 `--connect` cannot be combined with `--server` or `CODEX_TAMER_SERVER`.
 Commands do not aggregate independent server results; `servers ping --all` is
@@ -242,6 +318,11 @@ The config path resolves in this order:
 1. Global `--config PATH`
 2. `CODEX_TAMER_CONFIG`
 3. `~/.config/codex-tamer/config.toml`
+
+A missing path at step 3 behaves as an empty config. A missing path selected by
+`--config` or `CODEX_TAMER_CONFIG` is an error. Top-level and per-server `model`
+and `model_reasoning_effort` values are thread/turn defaults only; they do not
+select, start, or identify the app-server.
 
 ## Agent Quickstart
 
@@ -255,9 +336,15 @@ Use JSON for discovery and exact IDs:
 
 ```bash
 codex-tamer servers ping --json
-codex-tamer list --since 24h --limit 20 --json
+codex-tamer list --since 24h --limit 20 --sort updated --desc --json
 codex-tamer search threads "release process" --limit 10 --json
 ```
+
+Pair `--since` with `--sort updated --desc`. Without that explicit order,
+`codex-tamer` must scan every app-server page to avoid missing recent threads
+in server-defined order; `--limit` caps returned matches rather than the amount
+of persisted history scanned. This matters for large session stores and for
+`CODEX_HOME` on WSL DrvFS.
 
 Inspect one selected thread:
 
@@ -366,9 +453,13 @@ Interrupt explicitly:
 codex-tamer interrupt THREAD_ID TURN_ID --json
 ```
 
-`send`, `steer`, and `settings set` retry once after the exact unloaded-thread
-error by resuming the thread. `send` and `steer` reject an explicit
-`canAcceptDirectInput: false` before submitting input.
+`send` and `settings set` may retry once after the exact unloaded-thread error
+by resuming persisted state on the selected endpoint. Do this only when another
+runtime is not actively writing the same thread. `steer` never resumes: it only
+targets an active turn already loaded in the selected app-server and therefore
+cannot masquerade as control of a private VS Code stdio process. `send` and
+`steer` reject an explicit `canAcceptDirectInput: false` before submitting
+input.
 
 ## Machine Output
 
@@ -392,6 +483,7 @@ Important output shapes include:
 | `result` | `{ server, threadId, turnId, status, assistantResponses, finalAssistantText, turn }` |
 | `events follow` | NDJSON `attached`, snapshot/live assistant, progress, and terminal records |
 | `inject` | `{ server, threadId, status, itemCount }` |
+| `servers start/status/stop` | `{ server, status, backend, endpoint, codexHome, running, ... }` |
 
 The CLI does not currently expose a versioned JSON-RPC envelope to its caller;
 the table above is a command-specific CLI contract. Nested thread and turn
@@ -416,12 +508,19 @@ On codes `2`, `3`, and `130`, callers must inspect stderr. A streaming command
 can have already emitted valid NDJSON before a later transport or protocol
 error, so also check the process exit code.
 
+Ordinary JSON-RPC requests wait up to 120 seconds without receiving an
+app-server message before exiting with code `3`. Turn-level `--timeout` options
+remain separate operation deadlines.
+
 ## Command Reference
 
 | Command | Purpose |
 | --- | --- |
-| `servers` | List configured endpoint aliases without connecting. |
-| `servers ping` | Check one target, or all configured targets with `--all`. |
+| `servers` | List configured endpoint aliases, or the inferred managed target. |
+| `servers ping` | Probe one target, or all configured targets with `--all`, without starting it. |
+| `servers start` | Start or reuse the inferred `CODEX_HOME` managed listener. |
+| `servers status` | Probe managed listener identity and ownership without starting it. |
+| `servers stop` | Stop only the managed listener process started by `codex-tamer`. |
 | `list` | List threads with cursor, time, cwd, pin, provider, source, and ancestry filters. |
 | `search threads QUERY` | Search thread metadata and previews. |
 | `show THREAD_ID` | Read thread metadata plus paged turns. |

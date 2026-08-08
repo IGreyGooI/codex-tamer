@@ -416,6 +416,10 @@ mod tests {
             "ping\n"
         );
         assert_eq!(
+            completion_candidates("st", &[String::from("servers")]),
+            "start\nstatus\nstop\n"
+        );
+        assert_eq!(
             completion_candidates("s", &[String::from("annotate")]),
             "set\nsearch\n"
         );

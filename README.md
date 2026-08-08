@@ -168,16 +168,19 @@ The workflow can resume a draft Release, but refuses to replace assets on an
 already-published Release.
 
 The local release script runs Node test coverage plus the locked Rust test,
-lint, and release-build preflight before it creates a tag. It defaults to the
-`upstream` git remote; override only the remote name when needed. The selected
-remote's push URL must still resolve to `IGreyGooI/codex-tamer`:
+lint, and release-build preflight. It pushes the release commit to `main`, runs
+the five-platform workflow against that exact SHA, and creates an annotated tag
+only after the remote gate succeeds. It defaults to the `upstream` git remote;
+override only the remote name when needed. The selected remote must have exactly
+one fetch URL and one push URL, both resolving to `IGreyGooI/codex-tamer`:
 
 ```bash
 CODEX_TAMER_RELEASE_REMOTE=upstream node scripts/release.mjs patch
 ```
 
-The local script creates and pushes the release commit and tag; it leaves
-GitHub Release creation to the tag workflow.
+The local script creates and pushes the release commit and tag, then restores
+the empty `Unreleased` section. GitHub Release creation remains in the tag
+workflow.
 
 ## Shared App-Server
 
@@ -200,7 +203,9 @@ If `XDG_RUNTIME_DIR` is unset, the short UID-specific runtime root
 limits. Pass `--server managed` to select this synthetic target explicitly.
 The alias `managed` is reserved and cannot be declared under `[servers]`. The
 runtime directories and connected listener peer must belong to the current UID;
-the directories use mode `0700`.
+the directories use mode `0700`. A configured `XDG_RUNTIME_DIR` must already be
+a real current-user `0700` directory and short enough for the final 103-byte
+portable Unix-socket path limit.
 `codex-tamer` refuses an unsafe directory rather than placing the control socket
 inside a permission-inaccurate WSL DrvFS `CODEX_HOME` or falling back to TCP.
 It does not create a config file or run `codex app-server daemon bootstrap`.

@@ -25,6 +25,9 @@ const ROOT = join(__dirname, "..");
 const PACKAGE_NAME = "codex-tamer";
 const RELEASE_REPOSITORY = "IGreyGooI/codex-tamer";
 const RELEASE_BRANCH = "main";
+const RELEASE_WORKFLOW = "release-assets.yml";
+const RELEASE_GATE_DISCOVERY_TIMEOUT_MS = 60_000;
+const RELEASE_GATE_POLL_MS = 2_000;
 const BUMP_ARGS = new Set(["major", "minor", "patch"]);
 const VERSION_ARG = /^\d+\.\d+\.\d+$/;
 const cargoTomlPath = join(ROOT, "Cargo.toml");
@@ -91,7 +94,15 @@ export function validateReleasePushUrl(pushUrl) {
 	return repository;
 }
 
-export function validateReleaseRemoteUrls(fetchUrl, pushUrl) {
+export function validateReleaseRemoteUrls(fetchUrls, pushUrls) {
+	if (!Array.isArray(fetchUrls) || fetchUrls.length !== 1) {
+		throw new Error("release remote must have exactly one fetch URL");
+	}
+	if (!Array.isArray(pushUrls) || pushUrls.length !== 1) {
+		throw new Error("release remote must have exactly one push URL");
+	}
+	const [fetchUrl] = fetchUrls;
+	const [pushUrl] = pushUrls;
 	let fetchRepository;
 	try {
 		fetchRepository = validateReleasePushUrl(fetchUrl);
@@ -262,17 +273,22 @@ function ensureTools() {
 	runFile("git", ["--version"], { silent: true });
 	runFile(process.execPath, ["--version"], { silent: true });
 	runFile("cargo", ["--version"], { silent: true });
+	runFile("gh", ["--version"], { silent: true });
 }
 
 function ensureReleasePushTarget(releaseRemote) {
-	const fetchUrl = runFile("git", ["remote", "get-url", releaseRemote], {
+	const fetchUrls = runFile("git", ["remote", "get-url", "--all", releaseRemote], {
 		silent: true,
-	}).trim();
-	const pushUrl = runFile("git", ["remote", "get-url", "--push", releaseRemote], {
+	})
+		.split(/\r?\n/)
+		.filter(Boolean);
+	const pushUrls = runFile("git", ["remote", "get-url", "--push", "--all", releaseRemote], {
 		silent: true,
-	}).trim();
+	})
+		.split(/\r?\n/)
+		.filter(Boolean);
 	try {
-		validateReleaseRemoteUrls(fetchUrl, pushUrl);
+		validateReleaseRemoteUrls(fetchUrls, pushUrls);
 	} catch (error) {
 		console.error(`Error: ${error.message}`);
 		process.exit(1);
@@ -385,6 +401,94 @@ function runReleasePreflight() {
 	}
 }
 
+function failRelease(message) {
+	console.error(`Error: ${message}`);
+	process.exit(1);
+}
+
+function discoverReleaseGateRun(releaseCommit) {
+	const deadline = Date.now() + RELEASE_GATE_DISCOVERY_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		const output = runFile(
+			"gh",
+			[
+				"run",
+				"list",
+				"--repo",
+				RELEASE_REPOSITORY,
+				"--workflow",
+				RELEASE_WORKFLOW,
+				"--event",
+				"workflow_dispatch",
+				"--commit",
+				releaseCommit,
+				"--limit",
+				"10",
+				"--json",
+				"databaseId,headSha",
+			],
+			{ silent: true, timeout: 30_000 },
+		);
+		let runs;
+		try {
+			runs = JSON.parse(output);
+		} catch (error) {
+			failRelease(`GitHub returned malformed release-gate JSON: ${error.message}`);
+		}
+		const run = runs.find((candidate) => candidate.headSha === releaseCommit);
+		if (run && Number.isSafeInteger(run.databaseId) && run.databaseId > 0) {
+			return run.databaseId;
+		}
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RELEASE_GATE_POLL_MS);
+	}
+	failRelease(`timed out discovering the release-gate run for ${releaseCommit}`);
+}
+
+function runRemoteReleasePreflight(releaseCommit) {
+	runFile("gh", [
+		"workflow",
+		"run",
+		RELEASE_WORKFLOW,
+		"--repo",
+		RELEASE_REPOSITORY,
+		"--ref",
+		RELEASE_BRANCH,
+		"-f",
+		`expected_sha=${releaseCommit}`,
+	]);
+	const runId = discoverReleaseGateRun(releaseCommit);
+	runFile("gh", [
+		"run",
+		"watch",
+		String(runId),
+		"--repo",
+		RELEASE_REPOSITORY,
+		"--exit-status",
+	]);
+	const report = JSON.parse(
+		runFile(
+			"gh",
+			[
+				"run",
+				"view",
+				String(runId),
+				"--repo",
+				RELEASE_REPOSITORY,
+				"--json",
+				"event,headSha,conclusion",
+			],
+			{ silent: true, timeout: 30_000 },
+		),
+	);
+	if (
+		report.event !== "workflow_dispatch" ||
+		report.headSha !== releaseCommit ||
+		report.conclusion !== "success"
+	) {
+		failRelease(`release-gate run ${runId} did not validate exact commit ${releaseCommit}`);
+	}
+}
+
 function main(args = process.argv.slice(2), environment = process.env) {
 	const releaseArg = args[0];
 	if (
@@ -438,8 +542,11 @@ function main(args = process.argv.slice(2), environment = process.env) {
 	}
 	runFile("git", ["add", ...releaseCommitPaths]);
 	runFile("git", ["commit", "-m", `Release v${version}`]);
-	runFile("git", ["tag", `v${version}`]);
-	runFile("git", ["push", "--atomic", releaseRemote, RELEASE_BRANCH, `v${version}`]);
+	runFile("git", ["push", releaseRemote, RELEASE_BRANCH]);
+	const releaseCommit = runFile("git", ["rev-parse", "HEAD"], { silent: true }).trim();
+	runRemoteReleasePreflight(releaseCommit);
+	runFile("git", ["tag", "-a", `v${version}`, "-m", `codex-tamer v${version}`]);
+	runFile("git", ["push", releaseRemote, `v${version}`]);
 
 	addUnreleasedSection();
 	runFile("git", ["add", "CHANGELOG.md"]);

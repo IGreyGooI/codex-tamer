@@ -28,7 +28,7 @@ mod tests {
     #[cfg(unix)]
     use super::config::{
         managed_runtime_root, managed_runtime_root_from, managed_socket_path_from,
-        resolve_codex_home,
+        resolve_codex_home, validate_managed_socket_path, validate_xdg_runtime_directory,
     };
     use std::collections::BTreeMap;
     #[cfg(unix)]
@@ -413,6 +413,31 @@ auth_token_en = "CODEX_APP_SERVER_TOKEN"
             "fallback socket path is too long: {}",
             socket.display()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_socket_paths_reject_the_portable_unix_limit() {
+        let socket = PathBuf::from("/tmp").join("x".repeat(104));
+
+        let error = validate_managed_socket_path(&socket).unwrap_err();
+
+        assert!(error.to_string().contains("Unix socket path"));
+        assert!(error.to_string().contains("103 bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_runtime_directory_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = validate_xdg_runtime_directory(temp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("XDG_RUNTIME_DIR"));
+        assert!(error.to_string().contains("0700"));
     }
 
     #[test]

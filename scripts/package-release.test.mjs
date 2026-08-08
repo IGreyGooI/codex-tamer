@@ -143,7 +143,7 @@ test("builds a platform bundle containing the native CLI and unchanged skill", (
 		assert.equal(readFileSync(join(result.bundlePath, "install.mjs"), "utf8"), "// installer\n");
 		assert.equal(readFileSync(join(result.bundlePath, "LICENSE"), "utf8"), "MIT\n");
 		assert.deepEqual(JSON.parse(readFileSync(join(result.bundlePath, "manifest.json"), "utf8")), {
-			binary: "bin/codex-tamer",
+			binary: `bin/${binaryName}`,
 			installer: "install.mjs",
 			name: "codex-tamer",
 			skill: "skills/codex-tamer",

@@ -60,9 +60,11 @@ target explicitly. Treat `managed` as reserved; do not declare it under
 `[servers]`.
 
 Require the runtime directories and listener peer to belong to the current UID;
-require directory mode `0700`. Do not move the socket into a WSL DrvFS
-`CODEX_HOME`, relax directory permissions, or fall back to TCP. `codex-tamer`
-does not write a config file.
+require directory mode `0700`. A configured `XDG_RUNTIME_DIR` must already be a
+real current-user `0700` directory and short enough to keep the final socket at
+or below the portable 103-byte path limit. Do not move the socket into a WSL
+DrvFS `CODEX_HOME`, relax directory permissions, or fall back to TCP.
+`codex-tamer` does not write a config file.
 
 Resolve startup inputs in these orders:
 
@@ -71,8 +73,9 @@ Resolve startup inputs in these orders:
   `CODEX_HOME/packages/standalone/current/codex` > `codex` on `PATH`
 
 Require exact reviewed Codex `0.146.0`. Validate both the selected binary and
-the connected server's initialize `userAgent` and `codexHome`; never silently
-fall back after an explicit binary is rejected. Do not run
+the connected server's initialize `userAgent` as `codex_cli_rs/0.146.0` and its
+`codexHome`; never silently fall back after an explicit binary is rejected. Do
+not run
 `codex app-server daemon bootstrap`; it installs a detached hourly updater.
 
 Use an explicit target when the user selected another listener:

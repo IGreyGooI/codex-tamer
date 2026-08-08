@@ -3,8 +3,12 @@ use std::env;
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::net::IpAddr;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use anyhow::bail;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use url::Url;
@@ -15,6 +19,8 @@ pub const KNOWN_REASONING_EFFORTS: [&str; 8] = [
 pub const MANAGED_SERVER_ALIAS: &str = "managed";
 #[cfg(unix)]
 const MANAGED_SOCKET_FILE: &str = "app-server.sock";
+#[cfg(unix)]
+const PORTABLE_UNIX_SOCKET_PATH_MAX: usize = 103;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -466,11 +472,11 @@ pub fn resolve_managed_target(config: &AppConfig) -> Result<Target> {
     {
         let codex_home = resolve_codex_home(config)?;
         let runtime_root = managed_runtime_root()?;
+        let socket_path = managed_socket_path_from(&codex_home, &runtime_root);
+        validate_managed_socket_path(&socket_path)?;
         Ok(Target {
             server: MANAGED_SERVER_ALIAS.to_string(),
-            endpoint: Endpoint::Unix {
-                path: managed_socket_path_from(&codex_home, &runtime_root),
-            },
+            endpoint: Endpoint::Unix { path: socket_path },
             model: config.model.clone(),
             model_reasoning_effort: config.model_reasoning_effort.clone(),
         })
@@ -531,7 +537,28 @@ fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf> {
 #[cfg(unix)]
 pub fn managed_runtime_root() -> Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
-    managed_runtime_root_from(env::var_os("XDG_RUNTIME_DIR").as_deref(), uid)
+    let xdg_runtime_dir = env::var_os("XDG_RUNTIME_DIR");
+    if let Some(path) = xdg_runtime_dir.as_deref() {
+        validate_xdg_runtime_directory(Path::new(path))?;
+    }
+    managed_runtime_root_from(xdg_runtime_dir.as_deref(), uid)
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_xdg_runtime_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect XDG_RUNTIME_DIR `{}`", path.display()))?;
+    let expected_uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o777 != 0o700
+    {
+        bail!(
+            "XDG_RUNTIME_DIR `{}` must be a real directory owned by uid {expected_uid} with mode 0700",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -555,6 +582,22 @@ pub fn managed_socket_path_from(codex_home: &Path, runtime_root: &Path) -> PathB
     runtime_root
         .join(&digest.to_hex().as_str()[..24])
         .join(MANAGED_SOCKET_FILE)
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_managed_socket_path(path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.contains(&0) {
+        bail!("managed Unix socket path must not contain a NUL byte");
+    }
+    if bytes.len() > PORTABLE_UNIX_SOCKET_PATH_MAX {
+        bail!(
+            "managed Unix socket path `{}` is {} bytes; Unix socket paths must be at most {PORTABLE_UNIX_SOCKET_PATH_MAX} bytes for supported platforms. Use a shorter XDG_RUNTIME_DIR",
+            path.display(),
+            bytes.len()
+        );
+    }
+    Ok(())
 }
 
 fn absolute_path(path: PathBuf, scope: &str) -> Result<PathBuf> {

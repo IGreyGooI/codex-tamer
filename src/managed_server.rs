@@ -349,9 +349,7 @@ pub async fn stop(config: &AppConfig, endpoint: &Endpoint) -> Result<ManagedServ
 
 async fn connect_validated(endpoint: &Endpoint, codex_home: &Path) -> Result<RpcClient> {
     let client = RpcClient::connect(endpoint).await?;
-    #[cfg(unix)]
-    validate_managed_peer_uid(client.peer_identity())?;
-    validate_managed_identity(client.server_info(), codex_home)?;
+    validate_managed_connection(client.peer_identity(), client.server_info(), codex_home)?;
     Ok(client)
 }
 
@@ -382,8 +380,20 @@ async fn connect_existing(
             return Ok(None);
         }
     };
-    validate_managed_identity(client.server_info(), codex_home)?;
+    validate_managed_connection(client.peer_identity(), client.server_info(), codex_home)?;
     Ok(Some(client))
+}
+
+fn validate_managed_connection(
+    peer: Option<PeerIdentity>,
+    info: &InitializeInfo,
+    codex_home: &Path,
+) -> Result<()> {
+    #[cfg(unix)]
+    validate_managed_peer_uid(peer)?;
+    #[cfg(not(unix))]
+    let _ = peer;
+    validate_managed_identity(info, codex_home)
 }
 
 #[cfg(unix)]
@@ -881,9 +891,14 @@ fn server_version_from_user_agent(user_agent: &str) -> Result<&str> {
         .split_whitespace()
         .next()
         .ok_or_else(|| anyhow!("app-server initialize response has an empty userAgent"))?;
-    let (_, version) = product
+    let (name, version) = product
         .rsplit_once('/')
         .ok_or_else(|| anyhow!("app-server userAgent `{user_agent}` has no version"))?;
+    if name != "codex_cli_rs" {
+        bail!(
+            "app-server product `{name}` is incompatible; expected reviewed Codex product `codex_cli_rs`"
+        );
+    }
     if version != SUPPORTED_CODEX_VERSION {
         bail!(
             "app-server version `{version}` is incompatible; expected reviewed Codex {SUPPORTED_CODEX_VERSION}"
@@ -1006,11 +1021,32 @@ mod tests {
     #[test]
     fn app_server_user_agent_version_must_be_structured() {
         assert_eq!(
-            server_version_from_user_agent("codex-tamer/0.146.0 (Linux; x86_64)").unwrap(),
+            server_version_from_user_agent("codex_cli_rs/0.146.0 (Linux; x86_64)").unwrap(),
             "0.146.0"
         );
         assert!(server_version_from_user_agent("mock-codex").is_err());
+        assert!(server_version_from_user_agent("codex-tamer/0.146.0").is_err());
         assert!(server_version_from_user_agent("codex/0.146.0-dev").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_managed_connection_requires_a_same_uid_peer() {
+        let expected_uid = unsafe { libc::geteuid() };
+        let peer = PeerIdentity {
+            pid: Some(std::process::id()),
+            uid: expected_uid.saturating_add(1),
+            gid: unsafe { libc::getegid() },
+        };
+
+        let error = validate_managed_connection(
+            Some(peer),
+            &info("/tmp/codex-a", "codex_cli_rs/0.146.0 (Linux; x86_64)"),
+            Path::new("/tmp/codex-a"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(&expected_uid.to_string()));
     }
 
     #[cfg(unix)]

@@ -2,7 +2,26 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Require an exact-SHA five-platform pre-release workflow before the release
+  script creates an annotated tag, and reject release remotes with multiple
+  fetch or push URLs.
+
+### Fixed
+
+- Build Linux artifacts in a pinned Amazon Linux 2023 environment so the
+  documented glibc 2.34 and OpenSSL 3.0 ABI floor is real, and emit actionable
+  diagnostics when a release binary exceeds it or lacks a required library or
+  symbol version.
+- Keep release checks portable across Windows LF checkout, executable-bit,
+  drive-path, archive, and macOS Unix-socket path behaviors. Validate packaged
+  manifests against the actual native target and binary name on every supported
+  platform, and keep completion compatible with macOS Bash 3.2.
+- Require managed app-server reuse to validate a same-UID Unix peer and the
+  exact reviewed `codex_cli_rs/0.146.0` product. Reject unsafe
+  `XDG_RUNTIME_DIR` permissions and overlong managed socket paths before
+  connecting or starting a listener.
 
 ## [0.3.0] - 2026-08-08
 
@@ -70,14 +89,6 @@ _No unreleased changes._
 
 ### Fixed
 
-- Build Linux artifacts in a pinned Amazon Linux 2023 environment so the
-  documented glibc 2.34 and OpenSSL 3.0 ABI floor is real, and emit actionable
-  diagnostics when a release binary exceeds it or lacks a required library or
-  symbol version.
-- Keep release checks portable across Windows LF checkout, executable-bit,
-  drive-path, and archive behaviors, and canonicalize macOS temporary paths in
-  managed `CODEX_HOME` identity tests. Validate packaged manifests against the
-  actual native target on every supported architecture.
 - Update `anyhow` to `1.0.104` to address `RUSTSEC-2026-0190`, an unsound
   `Error::downcast_mut()` implementation in versions before `1.0.103`.
 - Make `servers status` reserve successful `stopped` output for an absent

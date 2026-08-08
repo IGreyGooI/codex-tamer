@@ -25,10 +25,13 @@ test("tag workflow builds, verifies, and uploads every supported platform bundle
 		assert.match(workflow, new RegExp(`bundle_target: ${target}\\b`));
 	}
 	assert.match(workflow, /tags:\s*\["v\*"\]/);
+	assert.match(workflow, /workflow_dispatch:\n\s+inputs:\n\s+expected_sha:/);
+	assert.match(workflow, /EXPECTED_SHA: \$\{\{ inputs\.expected_sha \}\}/);
+	assert.match(workflow, /\[ "\$GITHUB_SHA" != "\$EXPECTED_SHA" \]/);
 	assert.match(workflow, /permissions:\n  contents: read/);
 	assert.match(
 		workflow,
-		/release:\n[\s\S]*?permissions:\n      contents: write\n[\s\S]*?runs-on:/,
+		/release:\n\s+if: github\.event_name == 'push'\n[\s\S]*?permissions:\n      contents: write\n[\s\S]*?runs-on:/,
 	);
 	assert.match(workflow, /node scripts\/package-release\.mjs/);
 	assert.match(workflow, /archive_path=.*archivePath/);
@@ -111,18 +114,33 @@ test("the local release script validates a configurable private release remote",
 	);
 	assert.equal(
 		validateReleaseRemoteUrls(
-			"https://github.com/IGreyGooI/codex-tamer.git",
-			"git@github.com:IGreyGooI/codex-tamer.git",
+			["https://github.com/IGreyGooI/codex-tamer.git"],
+			["git@github.com:IGreyGooI/codex-tamer.git"],
 		),
 		"IGreyGooI/codex-tamer",
 	);
 	assert.throws(
 		() =>
 			validateReleaseRemoteUrls(
-				"https://github.com/example/fork.git",
-				"https://github.com/IGreyGooI/codex-tamer.git",
+				["https://github.com/example/fork.git"],
+				["https://github.com/IGreyGooI/codex-tamer.git"],
 			),
 		/release remote fetch URL/i,
+	);
+	assert.throws(
+		() =>
+			validateReleaseRemoteUrls(
+				["https://github.com/IGreyGooI/codex-tamer.git"],
+				[
+					"https://github.com/IGreyGooI/codex-tamer.git",
+					"git@github.com:IGreyGooI/codex-tamer.git",
+				],
+			),
+		/exactly one.*push URL/i,
+	);
+	assert.throws(
+		() => validateReleaseRemoteUrls([], ["git@github.com:IGreyGooI/codex-tamer.git"]),
+		/exactly one.*fetch URL/i,
 	);
 });
 
@@ -172,8 +190,10 @@ test("the local release script runs the complete locked preflight before tagging
 	const releaseScript = readFileSync(join(root, "scripts", "release.mjs"), "utf8");
 	assert.match(
 		releaseScript,
-		/runReleasePreflight\(\);[\s\S]*?\["tag", `v\$\{version\}`\]/,
+		/runReleasePreflight\(\);[\s\S]*?\["push", releaseRemote, RELEASE_BRANCH\][\s\S]*?runRemoteReleasePreflight\(releaseCommit\);[\s\S]*?\["tag", "-a", `v\$\{version\}`/,
 	);
+	assert.match(releaseScript, /gh[\s\S]*?workflow[\s\S]*?expected_sha/);
+	assert.match(releaseScript, /gh[\s\S]*?run[\s\S]*?watch[\s\S]*?--exit-status/);
 });
 
 test("the local release script leaves GitHub Release creation to the tag workflow", () => {

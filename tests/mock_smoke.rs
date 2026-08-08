@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 struct MockServer {
     _temp: TempDir,
+    _managed_runtime_temp: Option<TempDir>,
     socket: PathBuf,
     config: PathBuf,
     received: Arc<Mutex<Vec<Value>>>,
@@ -35,6 +36,23 @@ struct TcpMockServer {
 }
 
 type ResponseOverrides = Arc<HashMap<String, Value>>;
+
+fn managed_runtime_fixture(_temp: &TempDir) -> (PathBuf, Option<TempDir>) {
+    #[cfg(target_os = "macos")]
+    {
+        let runtime = tempfile::Builder::new()
+            .prefix("codex-tamer-")
+            .tempdir_in("/tmp")
+            .expect("short managed runtime tempdir");
+        let path = runtime.path().to_path_buf();
+        (path, Some(runtime))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        (_temp.path().join("runtime"), None)
+    }
+}
 
 #[derive(Clone)]
 struct GoalState {
@@ -370,6 +388,7 @@ impl MockServer {
 
         Self {
             _temp: temp,
+            _managed_runtime_temp: None,
             socket,
             config,
             received,
@@ -394,7 +413,7 @@ impl MockServer {
 
         let temp = TempDir::new().expect("tempdir");
         let managed_home = temp.path().join("codex-home");
-        let managed_runtime = temp.path().join("runtime");
+        let (managed_runtime, managed_runtime_temp) = managed_runtime_fixture(&temp);
         let fake_user_home = temp.path().join("user-home");
         fs::create_dir_all(&managed_home).expect("codex home");
         fs::create_dir_all(&managed_runtime).expect("runtime");
@@ -437,6 +456,7 @@ impl MockServer {
 
         Self {
             _temp: temp,
+            _managed_runtime_temp: managed_runtime_temp,
             socket,
             config,
             received,
@@ -2032,7 +2052,7 @@ fn missing_config_starts_the_selected_codex_listener_with_exact_arguments() {
 
     let temp = TempDir::new().expect("tempdir");
     let codex_home = temp.path().join("codex-home");
-    let runtime = temp.path().join("runtime");
+    let (runtime, _runtime_temp) = managed_runtime_fixture(&temp);
     let user_home = temp.path().join("user-home");
     fs::create_dir_all(&codex_home).expect("codex home");
     fs::create_dir_all(&runtime).expect("runtime");
@@ -2163,7 +2183,7 @@ fn concurrent_first_start_spawns_one_listener_and_reuses_it() {
 
     let temp = TempDir::new().expect("tempdir");
     let codex_home = temp.path().join("codex-home");
-    let runtime = temp.path().join("runtime");
+    let (runtime, _runtime_temp) = managed_runtime_fixture(&temp);
     let user_home = temp.path().join("user-home");
     fs::create_dir_all(&codex_home).expect("codex home");
     fs::create_dir_all(&runtime).expect("runtime");
@@ -2491,7 +2511,8 @@ path = "/tmp/personal.sock"
         .args(["completion", "script", "bash"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("mapfile -t COMPREPLY"))
+        .stdout(predicates::str::contains("while IFS= read -r candidate"))
+        .stdout(predicates::str::contains("COMPREPLY+=(\"$candidate\")"))
         .stdout(predicates::str::contains(
             "complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer",
         ))

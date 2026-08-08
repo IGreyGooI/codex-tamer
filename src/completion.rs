@@ -345,11 +345,14 @@ fn permanent_completion_commands(shell: CompletionShell) -> Vec<&'static str> {
 fn bash_completion_script() -> String {
     r#"_codex_tamer_completion() {
   local cur
+  local candidate
   local -a words
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   words=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
-  mapfile -t COMPREPLY < <(codex-tamer __complete -- "$cur" "${words[@]}" 2>/dev/null)
+  while IFS= read -r candidate; do
+    COMPREPLY+=("$candidate")
+  done < <(codex-tamer __complete -- "$cur" "${words[@]}" 2>/dev/null)
 }
 
 complete -o bashdefault -o default -F _codex_tamer_completion codex-tamer

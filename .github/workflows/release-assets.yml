@@ -3,6 +3,12 @@ name: Release Assets
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact main commit to validate before tagging
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -40,7 +46,7 @@ jobs:
             binary: target/x86_64-pc-windows-msvc/release/codex-tamer.exe
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Check out tagged source
+      - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
@@ -55,11 +61,26 @@ jobs:
           targets: ${{ matrix.rust_target }}
           components: rustfmt, clippy
       - name: Verify tag version
+        if: github.event_name == 'push'
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           test "$version" = "$cargo_version"
+      - name: Verify pre-release commit
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_SHA" != "$EXPECTED_SHA" ]; then
+            echo "workflow resolved $GITHUB_SHA, expected $EXPECTED_SHA" >&2
+            exit 1
+          fi
       - name: Run Node tests
         shell: bash
         run: node --test scripts/*.test.mjs
@@ -154,7 +175,8 @@ jobs:
             --json > install-result.json
           binary_name="codex-tamer"
           if [ "${{ matrix.bundle_target }}" = "windows-x86_64" ]; then binary_name="codex-tamer.exe"; fi
-          test "$("${install_root}/bin/${binary_name}" --version)" = "codex-tamer ${GITHUB_REF_NAME#v}"
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$("${install_root}/bin/${binary_name}" --version)" = "codex-tamer ${package_version}"
           node -e 'const fs=require("fs"); const path=require("path"); const root=process.argv[1]; const installed=process.argv[2]; if (!fs.readFileSync(path.join(root,"skills/codex-tamer/SKILL.md")).equals(fs.readFileSync(path.join(installed,"codex-tamer/SKILL.md")))) process.exit(1)' "$PWD" "${install_root}/skills"
       - name: Upload verified bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -167,6 +189,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name == 'push'
     name: Publish GitHub Release
     needs: build
     permissions:

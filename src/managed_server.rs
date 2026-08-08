@@ -986,6 +986,35 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn wait_for_recorded_pid(path: &Path, label: &str) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::read_to_string(path) {
+                Ok(contents) => match contents.parse::<u32>() {
+                    Ok(pid) => return pid,
+                    Err(_) if Instant::now() < deadline => {}
+                    Err(error) => panic!("{label} did not write a numeric pid: {error}"),
+                },
+                Err(error) if error.kind() == ErrorKind::NotFound && Instant::now() < deadline => {}
+                Err(error) => panic!("failed to read {label} pid: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_process_exits(pid: u32, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_exists(pid).unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_exists(pid).unwrap(),
+            "{label} pid {pid} survived cleanup"
+        );
+    }
+
     fn info(home: &str, user_agent: &str) -> InitializeInfo {
         InitializeInfo {
             user_agent: user_agent.to_string(),
@@ -1098,6 +1127,52 @@ mod tests {
 
         let error = read_active_process_record(&path).unwrap_err();
         assert!(error.to_string().contains("must be owned by uid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_spawn_failure_terminates_a_ready_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = TempDir::new().unwrap();
+        let leader_path = temp.path().join("leader.pid");
+        let descendant_path = temp.path().join("descendant.pid");
+        let script = r#"
+printf '%s' "$$" > "$CODEX_TAMER_TEST_LEADER_PID"
+/bin/sleep 30 &
+descendant=$!
+printf '%s' "$descendant" > "$CODEX_TAMER_TEST_DESCENDANT_PID"
+wait "$descendant"
+"#;
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .env("CODEX_TAMER_TEST_LEADER_PID", &leader_path)
+            .env("CODEX_TAMER_TEST_DESCENDANT_PID", &descendant_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let leader = wait_for_recorded_pid(&leader_path, "leader");
+        let descendant = wait_for_recorded_pid(&descendant_path, "descendant");
+        assert_eq!(leader, child.id());
+        assert!(process_exists(leader).unwrap());
+        assert!(process_exists(descendant).unwrap());
+
+        let error = cleanup_spawn_failure(&mut child, anyhow!("forced process record failure"));
+
+        assert!(error.to_string().contains("forced process record failure"));
+        assert_process_exits(leader, "leader");
+        assert_process_exits(descendant, "descendant");
     }
 
     #[cfg(unix)]

@@ -47,9 +47,22 @@ test("tag workflow builds, verifies, and uploads every supported platform bundle
 		/- runner: macos-15\n\s+rust_target: aarch64-apple-darwin/,
 	);
 	assert.match(workflow, /Verify Linux ABI baseline/);
-	assert.match(workflow, /GLIBC_2\.34/);
-	assert.match(workflow, /libssl\\\.so\\\.3/);
-	assert.match(workflow, /libcrypto\\\.so\\\.3/);
+	assert.match(
+		workflow,
+		/amazonlinux@sha256:694092ae18877ed4e3cb9b643759ba95df1f12af12528fefa18f60f79d4c1568/,
+	);
+	assert.match(workflow, /--target-dir release-target/);
+	assert.match(workflow, /rust_sysroot="\$\(rustc --print sysroot\)"/);
+	assert.doesNotMatch(workflow, /--volume "\$CARGO_HOME/);
+	assert.match(workflow, /gcc-11\.5\.0-5\.amzn2023\.0\.5/);
+	assert.match(workflow, /openssl-devel-1:3\.5\.5-1\.amzn2023\.0\.5/);
+	assert.match(workflow, /pkgconf-pkg-config-1\.8\.0-4\.amzn2023\.0\.2/);
+	assert.match(workflow, /glibc_max="2\.34"/);
+	assert.match(workflow, /detected maximum GLIBC_/);
+	assert.match(workflow, /for library in libssl\.so\.3 libcrypto\.so\.3/);
+	assert.match(workflow, /does not declare the required \$library dependency/);
+	assert.match(workflow, /openssl_symbol_floor="OPENSSL_3\.0\.0"/);
+	assert.match(workflow, /requires unsupported OpenSSL symbol versions/);
 	assert.match(workflow, /readFileSync\("CHANGELOG\.md"/);
 	assert.match(workflow, /--notes-file "\$release_notes"/);
 	assert.match(workflow, /Verify tag provenance/);

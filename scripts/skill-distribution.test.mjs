@@ -5,6 +5,11 @@ import test from "node:test";
 
 const root = resolve(import.meta.dirname, "..");
 
+test("repository text keeps LF line endings on every checkout platform", () => {
+	const attributes = readFileSync(join(root, ".gitattributes"), "utf8");
+	assert.match(attributes, /^\* text=auto eol=lf$/m);
+});
+
 test("the packaged Skill declares the codex-tamer PATH dependency", () => {
 	const skill = readFileSync(join(root, "skills", "codex-tamer", "SKILL.md"), "utf8");
 	const frontmatter = skill.match(/^---\n([\s\S]*?)\n---\n/);

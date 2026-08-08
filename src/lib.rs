@@ -358,11 +358,15 @@ auth_token_en = "CODEX_APP_SERVER_TOKEN"
     #[cfg(unix)]
     #[test]
     fn empty_config_resolves_one_managed_target_for_codex_home() {
-        let codex_home = PathBuf::from("/tmp/codex-home-a");
+        let temp = tempfile::TempDir::new().unwrap();
+        let configured_home = temp.path().join("codex-home-a");
+        let canonical_home = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .join("codex-home-a");
         let config = AppConfig {
             managed: ManagedConfig {
                 codex: Some(PathBuf::from("/opt/codex/bin/codex")),
-                codex_home: Some(codex_home.clone()),
+                codex_home: Some(configured_home),
             },
             model: Some("gpt-5.5".to_string()),
             model_reasoning_effort: Some("high".to_string()),
@@ -374,7 +378,7 @@ auth_token_en = "CODEX_APP_SERVER_TOKEN"
         assert_eq!(
             target.endpoint,
             Endpoint::Unix {
-                path: managed_socket_path_from(&codex_home, &managed_runtime_root().unwrap())
+                path: managed_socket_path_from(&canonical_home, &managed_runtime_root().unwrap())
             }
         );
         assert_eq!(target.model.as_deref(), Some("gpt-5.5"));
@@ -446,6 +450,9 @@ endpoint = "unix:///tmp/work.sock"
         std::fs::create_dir(&real_parent).unwrap();
         symlink(&real_parent, &linked_parent).unwrap();
 
+        let expected_home = std::fs::canonicalize(&real_parent)
+            .unwrap()
+            .join("future-codex-home");
         let configured_home = linked_parent.join("future-codex-home");
         let config = AppConfig {
             managed: ManagedConfig {
@@ -461,7 +468,7 @@ endpoint = "unix:///tmp/work.sock"
         let after_creation = resolve_codex_home(&config).unwrap();
 
         assert_eq!(before_creation, after_creation);
-        assert_eq!(after_creation, real_parent.join("future-codex-home"));
+        assert_eq!(after_creation, expected_home);
     }
 
     #[cfg(unix)]
@@ -476,6 +483,7 @@ endpoint = "unix:///tmp/work.sock"
         let linked_child = temp.path().join("linked-child");
         std::fs::create_dir_all(&real_child).unwrap();
         std::fs::create_dir(&expected_home).unwrap();
+        let expected_home = std::fs::canonicalize(expected_home).unwrap();
         symlink(&real_child, &linked_child).unwrap();
 
         let mut config = AppConfig::default();
@@ -495,6 +503,9 @@ endpoint = "unix:///tmp/work.sock"
         let link = temp.path().join("codex-home");
         std::fs::create_dir(&target_parent).unwrap();
         symlink(&target, &link).unwrap();
+        let expected_target = std::fs::canonicalize(&target_parent)
+            .unwrap()
+            .join("future-home");
 
         let mut config = AppConfig::default();
         config.managed.codex_home = Some(link);
@@ -502,8 +513,8 @@ endpoint = "unix:///tmp/work.sock"
         std::fs::create_dir(&target).unwrap();
         let after_creation = resolve_codex_home(&config).unwrap();
 
-        assert_eq!(before_creation, target);
-        assert_eq!(after_creation, target);
+        assert_eq!(before_creation, expected_target);
+        assert_eq!(after_creation, expected_target);
     }
 
     #[test]

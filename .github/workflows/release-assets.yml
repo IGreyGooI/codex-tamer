@@ -21,11 +21,11 @@ jobs:
           - runner: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
             bundle_target: linux-x86_64
-            binary: target/x86_64-unknown-linux-gnu/release/codex-tamer
+            binary: release-target/x86_64-unknown-linux-gnu/release/codex-tamer
           - runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             bundle_target: linux-aarch64
-            binary: target/aarch64-unknown-linux-gnu/release/codex-tamer
+            binary: release-target/aarch64-unknown-linux-gnu/release/codex-tamer
           - runner: macos-15
             rust_target: aarch64-apple-darwin
             bundle_target: macos-aarch64
@@ -71,18 +71,61 @@ jobs:
           cargo clippy --locked --target "${{ matrix.rust_target }}" --all-targets --all-features -- -D warnings
       - name: Build release binary
         shell: bash
-        run: cargo build --locked --release --target "${{ matrix.rust_target }}"
+        run: |
+          if [[ "${{ matrix.bundle_target }}" == linux-* ]]; then
+            rust_sysroot="$(rustc --print sysroot)"
+            docker run --rm \
+              --volume "$PWD:/workspace" \
+              --volume "$rust_sysroot:/rust-toolchain:ro" \
+              --workdir /workspace \
+              --env CARGO_HOME=/cargo-home \
+              --env CARGO_INCREMENTAL=0 \
+              --env RUST_TARGET="${{ matrix.rust_target }}" \
+              amazonlinux@sha256:694092ae18877ed4e3cb9b643759ba95df1f12af12528fefa18f60f79d4c1568 \
+              /bin/bash -euxo pipefail -c '
+                dnf install -y \
+                  gcc-11.5.0-5.amzn2023.0.5 \
+                  openssl-devel-1:3.5.5-1.amzn2023.0.5 \
+                  pkgconf-pkg-config-1.8.0-4.amzn2023.0.2
+                export PATH="/rust-toolchain/bin:$PATH"
+                cargo build --locked --release --target "$RUST_TARGET" --target-dir release-target
+              '
+          else
+            cargo build --locked --release --target "${{ matrix.rust_target }}"
+          fi
       - name: Verify Linux ABI baseline
         if: startsWith(matrix.bundle_target, 'linux-')
         shell: bash
         run: |
           binary="${{ matrix.binary }}"
-          glibc_baseline="GLIBC_2.34"
+          glibc_max="2.34"
           max_glibc="$(readelf --version-info "$binary" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' | sort -V | tail -1)"
-          test -n "$max_glibc"
-          test "$(printf '%s\n%s\n' "${glibc_baseline#GLIBC_}" "$max_glibc" | sort -V | tail -1)" = "${glibc_baseline#GLIBC_}"
-          readelf --dynamic "$binary" | grep -Eq '\(NEEDED\).*libssl\.so\.3'
-          readelf --dynamic "$binary" | grep -Eq '\(NEEDED\).*libcrypto\.so\.3'
+          if [ -z "$max_glibc" ]; then
+            echo "Could not detect a GLIBC requirement in $binary" >&2
+            exit 1
+          fi
+          echo "detected maximum GLIBC_${max_glibc}; allowed maximum GLIBC_${glibc_max}"
+          if [ "$(printf '%s\n%s\n' "$glibc_max" "$max_glibc" | sort -V | tail -1)" != "$glibc_max" ]; then
+            echo "$binary requires GLIBC_${max_glibc}, newer than allowed GLIBC_${glibc_max}" >&2
+            exit 1
+          fi
+          for library in libssl.so.3 libcrypto.so.3; do
+            if ! readelf --dynamic "$binary" | grep -Eq "\\(NEEDED\\).*$library"; then
+              echo "$binary does not declare the required $library dependency" >&2
+              exit 1
+            fi
+          done
+          openssl_symbol_floor="OPENSSL_3.0.0"
+          openssl_versions="$(readelf --version-info "$binary" | sed -n 's/.*Name: \(OPENSSL_[0-9.]*\).*/\1/p' | sort -u)"
+          if [ -z "$openssl_versions" ]; then
+            echo "Could not detect required OpenSSL symbol versions in $binary" >&2
+            exit 1
+          fi
+          echo "detected OpenSSL symbol versions: $openssl_versions"
+          if [ "$openssl_versions" != "$openssl_symbol_floor" ]; then
+            echo "$binary requires unsupported OpenSSL symbol versions: $openssl_versions" >&2
+            exit 1
+          fi
       - name: Package release bundle
         shell: bash
         run: |

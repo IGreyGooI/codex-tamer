@@ -13,7 +13,7 @@ import {
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -115,23 +115,27 @@ function repositoryVersion() {
 
 test("builds a platform bundle containing the native CLI and unchanged skill", () => {
 	withTempDirectory((directory) => {
+		const target = nativeTarget();
+		const binaryName = target.startsWith("windows-") ? "codex-tamer.exe" : "codex-tamer";
 		const root = join(directory, "repo");
 		const outDir = join(directory, "dist");
-		const binary = join(directory, "codex-tamer");
+		const binary = join(directory, binaryName);
 		createRepositoryFixture(root);
-		const binaryContent = writeBinaryFixture(binary, "linux-x86_64");
+		const binaryContent = writeBinaryFixture(binary, target);
 
 		const result = buildReleaseBundle({
 			root,
 			binary,
-			target: "linux-x86_64",
+			target,
 			outDir,
 		});
 
 		assert.equal(result.version, "1.2.3");
-		assert.equal(result.bundleName, "codex-tamer-1.2.3-linux-x86_64");
-		assert.deepEqual(readFileSync(join(result.bundlePath, "bin", "codex-tamer")), binaryContent);
-		assert.equal(lstatSync(join(result.bundlePath, "bin", "codex-tamer")).mode & 0o111, 0o111);
+		assert.equal(result.bundleName, `codex-tamer-1.2.3-${target}`);
+		assert.deepEqual(readFileSync(join(result.bundlePath, "bin", binaryName)), binaryContent);
+		if (!target.startsWith("windows-")) {
+			assert.equal(lstatSync(join(result.bundlePath, "bin", binaryName)).mode & 0o111, 0o111);
+		}
 		assert.equal(
 			readFileSync(join(result.bundlePath, "skills", "codex-tamer", "SKILL.md"), "utf8"),
 			"---\nname: codex-tamer\n---\nRun `codex-tamer`.\n",
@@ -227,10 +231,14 @@ test("archives a Linux bundle and writes its SHA256", () => {
 			readFileSync(archived.checksumPath, "utf8"),
 			`${expectedHash}  ${archived.archiveName}\n`,
 		);
-		const listed = spawnSync("tar", ["-tzf", archived.archivePath], { encoding: "utf8" });
+		const listed = spawnSync("tar", ["-tzf", basename(archived.archivePath)], {
+			cwd: dirname(archived.archivePath),
+			encoding: "utf8",
+		});
 		assert.equal(listed.status, 0, listed.stderr);
-		assert.match(listed.stdout, new RegExp(`^${bundle.bundleName}/manifest\\.json$`, "m"));
-		assert.match(listed.stdout, new RegExp(`^${bundle.bundleName}/skills/codex-tamer/SKILL\\.md$`, "m"));
+		const entries = listed.stdout.split(/\r?\n/);
+		assert.ok(entries.includes(`${bundle.bundleName}/manifest.json`));
+		assert.ok(entries.includes(`${bundle.bundleName}/skills/codex-tamer/SKILL.md`));
 	});
 });
 

@@ -42,10 +42,13 @@ function createBundle(
 		version = "0.2.4",
 	} = {},
 ) {
+	const binaryName = target.startsWith("windows-") ? "codex-tamer.exe" : "codex-tamer";
 	mkdirSync(join(root, "bin"), { recursive: true });
 	mkdirSync(join(root, "skills", "codex-tamer", "agents"), { recursive: true });
-	writeFileSync(join(root, "bin", "codex-tamer"), binaryText);
-	chmodSync(join(root, "bin", "codex-tamer"), 0o755);
+	writeFileSync(join(root, "bin", binaryName), binaryText);
+	if (process.platform !== "win32") {
+		chmodSync(join(root, "bin", binaryName), 0o755);
+	}
 	writeFileSync(join(root, "skills", "codex-tamer", "SKILL.md"), skillText);
 	writeFileSync(
 		join(root, "skills", "codex-tamer", "agents", "openai.yaml"),
@@ -58,7 +61,7 @@ function createBundle(
 				name: "codex-tamer",
 				version,
 				target,
-				binary: "bin/codex-tamer",
+				binary: `bin/${binaryName}`,
 				skill: "skills/codex-tamer",
 				installer: "install.mjs",
 			},
@@ -68,8 +71,26 @@ function createBundle(
 	);
 }
 
+function nativeInstallFixture() {
+	const target = {
+		"linux-x64": "linux-x86_64",
+		"linux-arm64": "linux-aarch64",
+		"darwin-x64": "macos-x86_64",
+		"darwin-arm64": "macos-aarch64",
+		"win32-x64": "windows-x86_64",
+	}[`${process.platform}-${process.arch}`];
+	assert.ok(target, `unsupported test platform: ${process.platform}-${process.arch}`);
+	return {
+		arch: process.arch,
+		binaryName: process.platform === "win32" ? "codex-tamer.exe" : "codex-tamer",
+		platform: process.platform,
+		target,
+	};
+}
+
 test("installs the binary and skill without rewriting the skill", () => {
 	withTempDirectory((directory) => {
+		const native = nativeInstallFixture();
 		const bundleRoot = join(directory, "bundle");
 		const binDir = join(directory, "home", ".local", "bin");
 		const skillsDir = join(directory, "home", ".agents", "skills");
@@ -83,27 +104,29 @@ test("installs the binary and skill without rewriting the skill", () => {
 			"Run `codex-tamer list --json`.",
 			"",
 		].join("\n");
-		createBundle(bundleRoot, { skillText });
+		createBundle(bundleRoot, { skillText, target: native.target });
 
 		const result = installBundle({
 			bundleRoot,
 			binDir,
 			skillsDir,
-			platform: "linux",
-			arch: "x64",
-			pathValue: `${binDir}${delimiter}/usr/bin`,
+			platform: native.platform,
+			arch: native.arch,
+			pathValue: `${binDir}${delimiter}${join(directory, "other-bin")}`,
 			verifyBinary: (binaryPath) => {
-				assert.equal(binaryPath, join(binDir, "codex-tamer"));
+				assert.equal(binaryPath, join(binDir, native.binaryName));
 				return "codex-tamer 0.2.4";
 			},
 		});
 
-		assert.equal(readFileSync(join(binDir, "codex-tamer"), "utf8"), "binary-v1\n");
+		assert.equal(readFileSync(join(binDir, native.binaryName), "utf8"), "binary-v1\n");
 		assert.equal(
 			readFileSync(join(skillsDir, "codex-tamer", "SKILL.md"), "utf8"),
 			skillText,
 		);
-		assert.equal(lstatSync(join(binDir, "codex-tamer")).mode & 0o111, 0o111);
+		if (process.platform !== "win32") {
+			assert.equal(lstatSync(join(binDir, native.binaryName)).mode & 0o111, 0o111);
+		}
 		assert.equal(result.binary.onPath, true);
 		assert.equal(result.binary.version, "codex-tamer 0.2.4");
 		assert.equal(result.skill.path, join(skillsDir, "codex-tamer"));
@@ -162,26 +185,29 @@ test("reports when the stable launcher directory is not on PATH", () => {
 
 test("reports an older codex-tamer that takes precedence on PATH", () => {
 	withTempDirectory((directory) => {
+		const native = nativeInstallFixture();
 		const bundleRoot = join(directory, "bundle");
 		const binDir = join(directory, "installed-bin");
 		const earlierBinDir = join(directory, "earlier-bin");
-		createBundle(bundleRoot);
+		createBundle(bundleRoot, { target: native.target });
 		mkdirSync(earlierBinDir, { recursive: true });
-		writeFileSync(join(earlierBinDir, "codex-tamer"), "old binary\n");
-		chmodSync(join(earlierBinDir, "codex-tamer"), 0o755);
+		writeFileSync(join(earlierBinDir, native.binaryName), "old binary\n");
+		if (process.platform !== "win32") {
+			chmodSync(join(earlierBinDir, native.binaryName), 0o755);
+		}
 
 		const result = installBundle({
 			bundleRoot,
 			binDir,
 			skillsDir: join(directory, "skills"),
-			platform: "linux",
-			arch: "x64",
+			platform: native.platform,
+			arch: native.arch,
 			pathValue: `${earlierBinDir}${delimiter}${binDir}`,
 			verifyBinary: () => "codex-tamer 0.2.4",
 		});
 
 		assert.equal(result.binary.onPath, false);
-		assert.equal(result.binary.resolvedPath, join(earlierBinDir, "codex-tamer"));
+		assert.equal(result.binary.resolvedPath, join(earlierBinDir, native.binaryName));
 		assert.match(result.binary.pathHint, /takes precedence|earlier-bin/);
 	});
 });

@@ -132,10 +132,6 @@ Expect a command to fail if the app-server policy requires an interactive
 approval request. Do not assume this headless CLI will approve it; configure an
 appropriate noninteractive policy at the trusted endpoint.
 
-Use separate Git worktrees or isolated working directories for concurrent write
-tasks. Do not let independent Agents mutate the same thread or checkout without
-an explicit coordination policy.
-
 ## Use Machine Output
 
 Pass `--json` whenever reading IDs, state, cursors, timestamps, or results.

@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Remove packaged-Skill guidance that required concurrent Agents to use
+  separate Git worktrees; checkout coordination remains with the user or
+  controlling Agent.
 
 ## [0.3.2] - 2026-08-08
 

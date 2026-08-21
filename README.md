@@ -73,8 +73,9 @@ endpoint instead of assuming the CLI will approve it.
 
 Do not treat `codex-tamer` as a security boundary. A controlling Agent must
 select an appropriate workspace, sandbox, credentials, and endpoint before
-submitting work. Run concurrent write tasks in separate Git worktrees or other
-isolated working directories.
+submitting work. `codex-tamer` does not require checkout isolation: concurrent
+Agents may modify the same checkout, with overlapping changes coordinated by
+the user or controlling Agent.
 
 ## Compatibility
 
@@ -390,7 +391,8 @@ codex-tamer interrupt THREAD_ID "$turn_id" --json
 ```
 
 Independent threads can be controlled by separate `codex-tamer` processes.
-Avoid uncontrolled concurrent writers to the same thread or working tree.
+They may share a working tree; `codex-tamer` leaves filesystem-write
+coordination to the user or controlling Agent.
 
 ## Turn Modes
 

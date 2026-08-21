@@ -115,7 +115,7 @@ authentication, or the source checkout. Download the archive and adjacent
 checksum from the public release:
 
 ```bash
-VERSION=0.3.2
+VERSION=0.3.3
 ASSET="codex-tamer-${VERSION}-linux-x86_64.tar.gz"
 BASE="https://github.com/IGreyGooI/codex-tamer/releases/download/v${VERSION}"
 curl --fail --location --remote-name "${BASE}/${ASSET}"
